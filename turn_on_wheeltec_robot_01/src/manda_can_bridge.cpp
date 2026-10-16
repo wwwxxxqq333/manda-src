@@ -1,0 +1,2184 @@
+#include "turn_on_wheeltec_robot_01/manda_can_bridge.h"
+
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <cstring>
+#include <chrono>
+#include <cmath>
+#include <cerrno>
+#include <limits>
+#include <algorithm>
+// manda V2.11: 单实例锁 (flock) —— 防止两个底盘节点同时抢 can0
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+// ============================================================
+// manda V2.06: steady_clock 当前毫秒数
+//   watchdog 的心跳时间戳用它而非 rclcpp::Time:
+//   - 不受 ROS 时钟源/仿真时间影响 (协议与看门狗计时必须单调)
+//   - 存成 int64 毫秒后可用 std::atomic, 消除 cmd 回调与定时器之间的数据竞争
+// ============================================================
+int64_t MandaCanBridge::steadyNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// ============================================================
+// manda V2.11: 单实例锁 (防两个底盘节点抢同一条 CAN 总线)
+// ------------------------------------------------------------
+// 事故背景见头文件说明: 两个 chassis_bridge_node 同时发 0x402,
+// 一个发停车帧、一个发速度帧, VCU 在两者间跳变 → 车一顿一顿。
+//
+// 实现要点:
+//   - 锁文件 /tmp/manda_chassis_bridge_<can_dev>.lock, 按设备名区分;
+//   - flock(LOCK_EX|LOCK_NB) 非阻塞独占锁, 第二个实例立刻失败;
+//   - 锁随进程消亡 (含 kill -9) 由内核自动释放,
+//     因此 /tmp 里残留的锁文件不会造成"永久起不来";
+//   - 失败时抛 std::runtime_error, 并由 main 捕获后以非零码退出,
+//     使 launch 能立即报错而不是静默产生"两个驱动源"。
+// ============================================================
+bool MandaCanBridge::acquireSingletonLock(const std::string & can_dev) {
+    singleton_lock_path_ = "/tmp/manda_chassis_bridge_" + can_dev + ".lock";
+
+    singleton_lock_fd_ = ::open(
+        singleton_lock_path_.c_str(), O_CREAT | O_RDWR, 0644);
+    if (singleton_lock_fd_ < 0) {
+        RCLCPP_ERROR(this->get_logger(),
+            "单实例锁: 无法打开锁文件 %s (errno=%d: %s)",
+            singleton_lock_path_.c_str(), errno, std::strerror(errno));
+        return false;
+    }
+
+    if (::flock(singleton_lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+        const int saved_errno = errno;
+        ::close(singleton_lock_fd_);
+        singleton_lock_fd_ = -1;
+
+        RCLCPP_FATAL(this->get_logger(),
+            "另一个 chassis_bridge_node 已独占 %s, 拒绝启动!",
+            can_dev.c_str());
+        RCLCPP_FATAL(this->get_logger(),
+            "两个底盘节点会同时发 0x402 (一个停车/一个给速), "
+            "VCU 在两者间跳变 → 车辆一顿一顿、左右摇摆。");
+        RCLCPP_FATAL(this->get_logger(),
+            "排查: pgrep -af '[c]hassis_bridge_node'  (应只有 1 个); "
+            "残留请执行 bash kill_all.sh");
+        RCLCPP_FATAL(this->get_logger(),
+            "锁文件 %s (errno=%d: %s) —— 该文件可安全删除, "
+            "锁本身由内核随进程释放。",
+            singleton_lock_path_.c_str(), saved_errno, std::strerror(saved_errno));
+        return false;
+    }
+
+    // 写入自己的 PID, 便于事后排查"上次是谁占着锁"
+    if (::ftruncate(singleton_lock_fd_, 0) == 0) {
+        const std::string pid_str = std::to_string(::getpid()) + "\n";
+        ssize_t ignored = ::write(singleton_lock_fd_, pid_str.c_str(), pid_str.size());
+        (void)ignored;
+    }
+
+    RCLCPP_INFO(this->get_logger(),
+        "单实例锁已获取: %s (pid=%d)",
+        singleton_lock_path_.c_str(), static_cast<int>(::getpid()));
+    return true;
+}
+
+void MandaCanBridge::releaseSingletonLock() {
+    if (singleton_lock_fd_ >= 0) {
+        ::flock(singleton_lock_fd_, LOCK_UN);
+        ::close(singleton_lock_fd_);
+        singleton_lock_fd_ = -1;
+    }
+}
+
+// ============================================================
+// 构造函数: 声明参数、激活 CAN、初始化收发
+// ============================================================
+MandaCanBridge::MandaCanBridge()
+    : Node("manda_can_bridge") {
+    // ---- 声明参数 ----
+    this->declare_parameter("car_model", "manda_4wid_4wis_native_front_rear_ackermann");
+    this->declare_parameter("can_device", "can0");
+    this->declare_parameter("bitrate", 500000);
+    this->declare_parameter("use_system_can_setup", true);
+    this->declare_parameter("wheel_base_x", 0.24);
+    this->declare_parameter("wheel_base_y", 0.19);
+    this->declare_parameter("wheel_radius", 0.10);
+    // 旧 0x08 逐轮控制的几何限制: 保留声明仅为兼容历史 yaml,
+    // V2.08 正常运行路径 (0x01) 不再使用 —— 四轮转角/轮速由 VCU 解算。
+    this->declare_parameter("max_steer_angle", 35.0);
+    this->declare_parameter("max_wheel_speed", 2.0);
+
+    // ---- manda V2.08: 整车运动限制 (0x01 模式下由上位机保证) ----
+    // 0x01 的四轮解算已交给 VCU, 上位机只负责: 速度上限 / 加速度斜坡 /
+    // 曲率约束 (R = |Vx|/|Vz| >= native_min_turning_radius) / 倒车门。
+    this->declare_parameter("native_min_turning_radius", 1.0);  // m
+    this->declare_parameter("max_forward_speed", 0.15);         // m/s
+    this->declare_parameter("max_reverse_speed", 0.08);         // m/s
+    this->declare_parameter("max_angular_vel", 0.20);           // rad/s
+    this->declare_parameter("max_linear_accel", 0.15);          // m/s² 下发前斜坡
+    this->declare_parameter("max_angular_accel", 0.30);         // rad/s² 下发前斜坡
+    // manda V2.17: 最低行驶速度 —— 取代原 spin_vx_threshold_ (已删除)
+    //   |Vx| < min_moving_speed  → Vx=0 且 Vz=0 (不允许只转不走)
+    //   |Vx| >= min_moving_speed → |Vz| <= |Vx|/R_min (走圆弧拐弯)
+    this->declare_parameter("min_moving_speed", 0.005);         // m/s
+
+    this->declare_parameter("velocity_loop_hz", 10.0);
+    this->declare_parameter("watchdog_timeout", 0.5);
+    this->declare_parameter("odom_frame_id", "odom_combined");
+    this->declare_parameter("base_frame_id", "base_footprint");
+    this->declare_parameter("cmd_vel_topic", "/cmd_vel");
+    this->declare_parameter("odom_topic", "/odom_wheel");
+    this->declare_parameter("battery_topic", "/battery_state");
+    this->declare_parameter("joint_state_topic", "/joint_states");
+    // 倒车安全门: 默认禁止倒车; 当前由原地旋转恢复方向
+    this->declare_parameter("allow_reverse", false);
+
+    // ---- manda V2.19: 分模式 vz 标度修正 ----
+    // V2.08 曾在 0x08 (前轮转向 + 后轮锁直) 下标出单一系数 1.84,
+    //   换到 0x01 官方运动学后该值很可能失效。
+    //   0x01 初始按协议单位取 1.0, 待重新标定后再填实测值。
+    //   0x04 原地旋转使用独立的目标角速度限幅，不复用该标度参数。
+    this->declare_parameter("vz_scale_mode_01", 1.0);
+    this->declare_parameter("vz_scale_mode_08", 1.84);  // 仅 LEGACY 回退参考
+
+    // ============================================================
+    // manda V2.19: 0x04 原地自旋参数
+    // ------------------------------------------------------------
+    // VCU 不会因 "Vx≈0 且 Vz≠0" 自动进入 0x04；桥必须显式切换模式。
+    // spin_* 参数控制纯旋转意图的识别、防抖和角速度限幅。
+    //
+    // ⚠ 这两个是**活参数**, 负责 0x01/0x04 切换时序:
+    //   sendModeSwitch() / updateMotionStateMachine() 仍在用它们保证
+    //   "0x401 前后 >= 250ms 完全静默" (协议硬性要求)。
+    //   2026-09-17 事故: 清理 spin_* 时误删了这两个 declare_parameter,
+    //   而下方读取代码与 manda_param.yaml 都还在 —— 于是启动即抛
+    //   "[FATAL] 启动失败: mode_switch_silence_ms" 并 exit 1,
+    //   底盘桥根本没起来 → /cmd_vel 订阅者=0 → 给点后车不动。
+    //   (教训: 删参数要连带删干净"声明+读取+yaml"三处, 留一处就炸)
+    // ============================================================
+    this->declare_parameter("mode_switch_silence_ms", 250.0);   // ms (协议要求 200ms)
+    this->declare_parameter("mode_switch_timeout_ms", 1500.0);  // ms
+
+    // ============================================================
+    // ★ 2026-09-28: 0x04 原地自旋相关参数 ★
+    // ------------------------------------------------------------
+    // enable_spin_mode 默认为 false —— 即使新代码存在问题, 首次启动
+    //   仍保持原来的纯 0x01 行为, 确认稳定后再手动改为 true。
+    // ⚠ 与 mode_switch_silence_ms / mode_switch_timeout_ms 的关系:
+    //   那两个是【已存在】的静默/超时参数, 本段不重复声明, 直接复用,
+    //   避免 "声明+读取+yaml 三处留一处就炸" 的历史事故重演。
+    // ============================================================
+    this->declare_parameter("enable_spin_mode", false);
+    this->declare_parameter("spin_vx_epsilon", 0.002);          // m/s
+    this->declare_parameter("spin_wz_enter", 0.05);             // rad/s
+    this->declare_parameter("spin_wz_exit", 0.002);             // rad/s
+    this->declare_parameter("spin_enter_confirm_frames", 3);
+    this->declare_parameter("spin_exit_confirm_frames", 2);
+    this->declare_parameter("max_spin_angular_vel", 0.20);      // rad/s
+    this->declare_parameter("cmd_vel_timeout", 0.30);           // s
+
+    wheel_base_x_ = this->get_parameter("wheel_base_x").as_double();
+    wheel_base_y_ = this->get_parameter("wheel_base_y").as_double();
+    wheel_radius_ = this->get_parameter("wheel_radius").as_double();
+    max_steer_angle_ = this->get_parameter("max_steer_angle").as_double();
+    max_wheel_speed_ = this->get_parameter("max_wheel_speed").as_double();
+    if (max_wheel_speed_ <= 0.0) max_wheel_speed_ = 2.0;
+    wheel_base_  = 2.0 * wheel_base_x_;
+    track_width_ = 2.0 * wheel_base_y_;
+    if (wheel_radius_ <= 0.0) wheel_radius_ = 0.10;
+
+    // ---- manda V2.08: 整车运动限制读取 ----
+    native_min_turning_radius_ = this->get_parameter("native_min_turning_radius").as_double();
+    if (native_min_turning_radius_ <= 0.0) native_min_turning_radius_ = 1.0;
+    max_forward_speed_ = this->get_parameter("max_forward_speed").as_double();
+    if (max_forward_speed_ <= 0.0) max_forward_speed_ = 0.15;
+    max_reverse_speed_ = this->get_parameter("max_reverse_speed").as_double();
+    if (max_reverse_speed_ < 0.0) max_reverse_speed_ = 0.08;
+    max_angular_vel_ = this->get_parameter("max_angular_vel").as_double();
+    if (max_angular_vel_ <= 0.0) max_angular_vel_ = 0.20;
+    min_moving_speed_ = this->get_parameter("min_moving_speed").as_double();
+    if (min_moving_speed_ < 0.0) min_moving_speed_ = 0.005;
+    max_linear_accel_ = this->get_parameter("max_linear_accel").as_double();
+    if (max_linear_accel_ <= 0.0) max_linear_accel_ = 0.15;
+    max_angular_accel_ = this->get_parameter("max_angular_accel").as_double();
+    if (max_angular_accel_ <= 0.0) max_angular_accel_ = 0.30;
+
+    odom_frame_id_ = this->get_parameter("odom_frame_id").as_string();
+    base_frame_id_ = this->get_parameter("base_frame_id").as_string();
+
+    // ---- 分模式 vz 标度读取 (V2.17: 只剩 0x01 生效) ----
+    vz_scale_mode_01_ = this->get_parameter("vz_scale_mode_01").as_double();
+    vz_scale_mode_08_ = this->get_parameter("vz_scale_mode_08").as_double();
+    if (vz_scale_mode_01_ <= 0.0) vz_scale_mode_01_ = 1.0;
+    if (vz_scale_mode_08_ <= 0.0) vz_scale_mode_08_ = 1.84;
+
+    double loop_hz = this->get_parameter("velocity_loop_hz").as_double();
+    if (loop_hz <= 0.0) loop_hz = 10.0;
+    loop_ms_ = static_cast<int>(1000.0 / loop_hz);
+
+    watchdog_timeout_ = this->get_parameter("watchdog_timeout").as_double();
+    if (watchdog_timeout_ <= 0.0) watchdog_timeout_ = 0.5;
+
+    // ---- 模式切换参数读取 (V2.17: 已删除全部 spin_* 参数) ----
+    mode_switch_silence_ms_  = this->get_parameter("mode_switch_silence_ms").as_double();
+    mode_switch_timeout_ms_  = this->get_parameter("mode_switch_timeout_ms").as_double();
+    if (mode_switch_silence_ms_ < 200.0) mode_switch_silence_ms_ = 250.0;
+    if (mode_switch_timeout_ms_ <= 0.0) mode_switch_timeout_ms_ = 1500.0;
+
+    // ---- 0x04 自旋参数读取 (2026-09-28) ----
+    enable_spin_mode_ = this->get_parameter("enable_spin_mode").as_bool();
+    spin_vx_epsilon_  = this->get_parameter("spin_vx_epsilon").as_double();
+    spin_wz_enter_    = this->get_parameter("spin_wz_enter").as_double();
+    spin_wz_exit_     = this->get_parameter("spin_wz_exit").as_double();
+    max_spin_angular_vel_ = this->get_parameter("max_spin_angular_vel").as_double();
+    cmd_vel_timeout_  = this->get_parameter("cmd_vel_timeout").as_double();
+    if (spin_vx_epsilon_ < 0.0) spin_vx_epsilon_ = 0.002;
+    if (spin_wz_enter_ <= 0.0) spin_wz_enter_ = 0.05;
+    if (spin_wz_exit_ < 0.0) spin_wz_exit_ = 0.002;
+    if (max_spin_angular_vel_ <= 0.0) max_spin_angular_vel_ = 0.20;
+    if (cmd_vel_timeout_ <= 0.0) cmd_vel_timeout_ = 0.30;
+    {
+        const int n = this->get_parameter("spin_enter_confirm_frames").as_int();
+        spin_enter_confirm_frames_ = (n > 0) ? n : 3;
+        const int m = this->get_parameter("spin_exit_confirm_frames").as_int();
+        spin_exit_confirm_frames_ = (m > 0) ? m : 2;
+    }
+    last_cmd_time_ = std::chrono::steady_clock::now();
+
+    std::string car_model = this->get_parameter("car_model").as_string();
+
+    // ---- 0. 自动激活 CAN 接口 ----
+    std::string can_dev = this->get_parameter("can_device").as_string();
+    int bitrate = this->get_parameter("bitrate").as_int();
+
+    // ---- manda V2.11: 先抢单实例锁, 再碰 CAN ----
+    // 必须在"配网/开 socket/起线程"之前: 一旦抢锁失败就立即退出,
+    // 绝不能走到后面 —— 否则第二个节点仍会打开 can0 并开始发 0x402,
+    // 那正是导致"一顿一顿"的根因。
+    if (!acquireSingletonLock(can_dev)) {
+        throw std::runtime_error(
+            "Duplicate chassis_bridge_node for " + can_dev +
+            " (另一个实例已独占该 CAN 总线)");
+    }
+
+    if (this->get_parameter("use_system_can_setup").as_bool()) {
+        std::string cmd = "sudo ip link set " + can_dev + " type can bitrate " + std::to_string(bitrate) + " 2>/dev/null";
+        system(cmd.c_str());
+        cmd = "sudo ip link set up " + can_dev + " 2>/dev/null";
+        system(cmd.c_str());
+        rclcpp::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // ---- 1. 初始化 SocketCAN ----
+    can_socket_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (can_socket_ < 0) {
+        RCLCPP_FATAL(this->get_logger(), "Failed to create CAN socket!");
+        rclcpp::shutdown();
+        return;
+    }
+    struct ifreq ifr{};
+    strcpy(ifr.ifr_name, can_dev.c_str());
+    if (ioctl(can_socket_, SIOCGIFINDEX, &ifr) < 0) {
+        RCLCPP_FATAL(this->get_logger(), "Failed to get CAN interface index for %s!", can_dev.c_str());
+        close(can_socket_);
+        can_socket_ = -1;
+        rclcpp::shutdown();
+        return;
+    }
+    struct sockaddr_can addr{};
+    addr.can_family = AF_CAN;
+    addr.can_ifindex = ifr.ifr_ifindex;
+    if (bind(can_socket_, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        RCLCPP_FATAL(this->get_logger(), "Failed to bind CAN socket to %s!", can_dev.c_str());
+        close(can_socket_);
+        can_socket_ = -1;
+        rclcpp::shutdown();
+        return;
+    }
+
+    // ---- 1.1 manda V2.11: 给 CAN socket 加接收超时 (修复退出卡死) ----
+    // ------------------------------------------------------------
+    // 事故: 未设置超时时 read() 会**永久阻塞**, 析构函数里
+    //       receive_thread_.join() 因此永远等不到接收线程退出,
+    //       整个进程僵死在退出流程 —— 日志停在 signal_handler(signum=2)
+    //       之后再无输出, 而节点其实还活着、还占着 can0。
+    //       这正是"Ctrl+C 后重复节点"反复出现的根源:
+    //       操作者以为已停止, 旧节点仍持有总线, 新节点一启动就抢帧。
+    //
+    // 修法: SO_RCVTIMEO 让 read() 每 100ms 超时返回一次,
+    //       循环得以检查 receive_running_ / rclcpp::ok() 后干净退出。
+    //       超时返回 EAGAIN/EWOULDBLOCK 属正常, 由循环 continue 处理。
+    // ------------------------------------------------------------
+    struct timeval rcv_timeout{};
+    rcv_timeout.tv_sec = 0;
+    rcv_timeout.tv_usec = 100000;   // 100ms
+    if (setsockopt(can_socket_, SOL_SOCKET, SO_RCVTIMEO,
+                   &rcv_timeout, sizeof(rcv_timeout)) < 0) {
+        RCLCPP_WARN(this->get_logger(),
+            "无法设置 CAN socket 接收超时 (errno=%d: %s); "
+            "退出时可能卡在接收线程 join", errno, std::strerror(errno));
+    }
+
+    // ---- 2. manda V2.08: 不在构造函数里抢发 0x401#01 ----
+    // 原因: 上电时底盘可能仍处于遥控器控制 (0x100 Byte[1]=0x01),
+    //       此时抢先发送 0x401 会与操作者争权, 且违反"先确认控制权再发帧"原则。
+    // 现在改为: 状态机先进入 WAIT_CONTROL, 收到首帧 0x100 并确认
+    //           Byte[1]==0x02 (指令控制) 后, 才由 PREPARE_01 发出 0x401#01。
+    // 注意: 接收线程在步骤 6 才启动, 因此这里不等待, 由状态机异步完成。
+    RCLCPP_INFO(this->get_logger(),
+        "Waiting for control mode confirmation (0x100 Byte[1]==0x02) before sending 0x401...");
+
+    // ---- manda V2.08: 状态机计时初始化 ----
+    // 初始状态为 WAIT_CONTROL, 尚未确认控制权, 不发任何运动帧。
+    state_enter_ts_    = std::chrono::steady_clock::now();
+    mode_cmd_sent_ts_  = std::chrono::steady_clock::now();
+
+    // ---- 3. 订阅 cmd_vel + 发布 odom / battery / joint_states ----
+    std::string cmd_vel_topic = this->get_parameter("cmd_vel_topic").as_string();
+    std::string odom_topic = this->get_parameter("odom_topic").as_string();
+    std::string battery_topic = this->get_parameter("battery_topic").as_string();
+    std::string joint_state_topic = this->get_parameter("joint_state_topic").as_string();
+
+    cmd_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+        cmd_vel_topic, 10,
+        std::bind(&MandaCanBridge::cmdVelCallback, this, std::placeholders::_1));
+    odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic, 10);
+    battery_pub_ = this->create_publisher<sensor_msgs::msg::BatteryState>(battery_topic, 10);
+    joint_state_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(joint_state_topic, 10);
+    // manda V2.06.1: 不再创建 tf_broadcaster_ —— TF 由 EKF 独占发布, 见头文件说明。
+
+    // ---- 4. 心跳看门狗 ----
+    last_cmd_time_ms_.store(steadyNowMs());
+    watchdog_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(100),
+        std::bind(&MandaCanBridge::watchdogCheck, this));
+
+    // ---- 5. 循环下发线程 ----
+    velocity_running_ = true;
+    velocity_thread_ = std::thread(&MandaCanBridge::velocityLoop, this);
+
+    // ---- 6. CAN 接收线程 ----
+    receive_thread_ = std::thread(&MandaCanBridge::canReceiveLoop, this);
+    RCLCPP_INFO(this->get_logger(),
+        "Manda CAN Bridge Started (V2.08 native 0x01 front/rear Ackermann)! "
+        "car=%s Loop=%dms Watchdog=%.1fs Rmin=%.2fm Vx=[%.2f,%.2f] wz=%.2f "
+        "allow_reverse=%d",
+        car_model.c_str(), loop_ms_, watchdog_timeout_, native_min_turning_radius_,
+        -max_reverse_speed_, max_forward_speed_, max_angular_vel_,
+        static_cast<int>(this->get_parameter("allow_reverse").as_bool()));
+}
+
+// ============================================================
+// 析构函数
+// ============================================================
+MandaCanBridge::~MandaCanBridge() {
+    // manda V2.06 安全修复: 顺序必须是"先停 TX 线程 → 再发最后一帧零速 → 再关 CAN"。
+    // ------------------------------------------------------------
+    // 原顺序 (先发零速, 再置 velocity_running_=false) 存在竞争:
+    //   1) 析构线程发送零速;
+    //   2) velocityLoop 恰好又跑一轮 (此时标志还没置 false),
+    //      把 target_vx_/target_vz_ 里残留的旧值再发出去;
+    //   → 最后一帧可能是非零速度, 车停不下来。
+    // 现在先 join 掉 TX 线程, 保证此后没有其它线程再写 socket,
+    // 再安全地补发零速, 最后才关闭 socket。
+    // ------------------------------------------------------------
+    // 注意: 仅覆盖正常退出 (ROS shutdown / Ctrl-C)。
+    //       kill -9 不执行析构函数, 禁止在自旋过程中强杀本节点。
+
+    // ---- 1. 先禁止速度线程继续产生新命令, 并等待其完全退出 ----
+    velocity_running_ = false;
+    if (velocity_thread_.joinable()) {
+        velocity_thread_.join();
+    }
+
+    // ---- 2. TX 线程已退出, 现在独占发送最后一帧零速 ----
+    // manda V2.08: 按"底盘当前实际模式"选匹配的停车帧:
+    //   0x01/0x02/0x04 → 0x402 Vx=Vy=Vz=0
+    //   0x08           → 0x403 四轮线速度全 0
+    //   其它/未知      → 按状态机预期模式推断
+    // 处于 250ms 静默窗口内 (PREPARE_*/WAIT_*) 时一个字节都不发 ——
+    // 静默期发帧会破坏 0x401 模式切换。
+    {
+        std::lock_guard<std::mutex> lock(velocity_mutex_);
+        if (can_socket_ >= 0) {
+            const bool in_silence_window =
+                motion_state_ == MotionState::WAIT_CONTROL ||
+                motion_state_ == MotionState::PREPARE_01 ||
+                motion_state_ == MotionState::WAIT_01 ||
+                motion_state_ == MotionState::PREPARE_RETURN_01 ||
+                motion_state_ == MotionState::REMOTE_OVERRIDE ||
+                motion_state_ == MotionState::MODE_ERROR;
+            if (!in_silence_window) {
+                sendZeroForConfirmedMode(state_.current_mode);
+            }
+        }
+    }
+
+    // ---- 3. 停止接收线程并关闭 socket ----
+    receive_running_ = false;
+    if (can_socket_ >= 0) {
+        close(can_socket_);
+        can_socket_ = -1;
+    }
+    if (receive_thread_.joinable()) {
+        receive_thread_.join();
+    }
+
+    // ---- 4. manda V2.11: 释放单实例锁 ----
+    // 放在最后、所有线程都已 join 之后: 保证"本节点确实不再发任何帧"
+    // 才让下一个实例能启动, 避免交接瞬间出现两个驱动源。
+    // (即便这里不执行, 进程退出时内核也会自动释放, 此处仅为确定性释放。)
+    releaseSingletonLock();
+}
+
+// ============================================================
+// 数据转换工具 (大端字节序)
+// ============================================================
+inline void MandaCanBridge::speedToCanBytes(float speed_mps, uint8_t &hi, uint8_t &lo) {
+    int16_t scaled = static_cast<int16_t>(speed_mps * 1000.0f);
+    hi = static_cast<uint8_t>((scaled >> 8) & 0xFF);
+    lo = static_cast<uint8_t>(scaled & 0xFF);
+}
+
+inline void MandaCanBridge::angleToCanBytes(float angle_deg, uint8_t &hi, uint8_t &lo) {
+    int16_t scaled = static_cast<int16_t>(angle_deg * 100.0f);
+    hi = static_cast<uint8_t>((scaled >> 8) & 0xFF);
+    lo = static_cast<uint8_t>(scaled & 0xFF);
+}
+
+inline float MandaCanBridge::canBytesToSpeed(uint8_t hi, uint8_t lo) {
+    int16_t raw = static_cast<int16_t>((static_cast<int16_t>(hi) << 8) | lo);
+    return static_cast<float>(raw) / 1000.0f;
+}
+
+inline float MandaCanBridge::canBytesToAngle(uint8_t hi, uint8_t lo) {
+    int16_t raw = static_cast<int16_t>((static_cast<int16_t>(hi) << 8) | lo);
+    return static_cast<float>(raw) / 100.0f;
+}
+
+// ============================================================
+// manda V2.08: 按底盘上报的运动模式选择 vz 标度系数
+// ------------------------------------------------------------
+// 0x104 Byte[4-5] 的 Vz 在不同运动模式下很可能有不同的标度:
+//   0x01 前后轮阿克曼 / 0x04 原地自旋 是 VCU 自行解算的官方运动学,
+//        旧的 0x08 标定值 (1.84) 不能沿用, 初始都取 1.0 (协议单位),
+//        待按新标定流程实测后再填。
+//   0x08 用户逐轮控制 保留历史标定值, 供回退对照。
+// 未知模式 (含上电初期的 mode=0) 按 1.0 处理, 不引入人为比例误差。
+// ============================================================
+double MandaCanBridge::vzScaleForMode(uint8_t mode) const {
+    switch (mode) {
+        case manda_mode::FRONT_REAR_ACKERMANN: return vz_scale_mode_01_;
+        // ★ 2026-09-28 恢复: 0x04 自旋模式标度 (待标定, 先 1.0)
+        case manda_mode::SPIN:                 return vz_scale_mode_04_;
+        case manda_mode::INDIVIDUAL:           return vz_scale_mode_08_;
+        default:                               return 1.0;
+    }
+}
+
+// ============================================================
+// ============================================================
+// [LEGACY 0x08] 逐轮控制辅助 — 以下至 "LEGACY 0x08 段结束" 为止
+// ------------------------------------------------------------
+// manda V2.08 起正常运行路径不再调用本段任何函数。
+// 保留原因:
+//   1) 它是 0x08 (用户逐轮控制) 模式下唯一的实现, 需要回退时可直接启用;
+//   2) computeAckermannKinematics 的右转符号处理 / 曲率限幅 / 轮速等比
+//      缩小等修复经验值得对照 (曾在 V1.09 修好过"直行却猛打方向")。
+// 何时才需要它: 把 normal_motion_mode 改回 0x08, 并在 velocityLoop 中
+//   恢复调用 sendAckermannCommand。
+// ============================================================
+// ============================================================
+// 纯阿克曼 (Ackermann) 逆运动学
+// 物理模型: 前轮转向 + 后轮直行驱动 (自行车模型扩展)
+//   1. 后轮转角恒为 0 (后轴固定, 不可转向)
+//   2. 旋转瞬心 (ICR) 位于后轴延长线上, 后轴中心横向速度为 0
+//   3. 内侧前轮转角 > 外侧前轮转角 (真正阿克曼几何)
+//   4. 转弯半径受限幅保护 (R_min 由内侧前轮最大转角决定)
+//
+// 注意: 这正是 V2.08 要废弃的方案 —— 前轮转向 + 后轮锁直, 小半径转弯时
+//       前后轮瞬时运动方向不一致, 轮胎只能靠侧滑释放几何冲突。
+//       0x01 模式把这套解算交给 VCU 的官方运动学 (前后轮反向转向)。
+// ============================================================
+void MandaCanBridge::computeAckermannKinematics(float vx, float omega,
+                                                float speeds[4], float angles[4]) {
+    // 纯阿克曼的后轮转角永远为 0
+    angles[1] = 0.0f; // RL
+    angles[3] = 0.0f; // RR
+
+    // 1. 直行模式
+    if (std::abs(omega) < 1e-5) {
+        for (int i = 0; i < 4; i++) {
+            speeds[i] = vx;
+            angles[i] = 0.0f;
+        }
+        return;
+    }
+
+    // 2. 原地旋转保护（纯阿克曼物理上无法原地旋转）
+    if (std::abs(vx) < 0.01) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Pure Ackermann cannot rotate in place. Output zero.");
+        for (int i = 0; i < 4; i++) { speeds[i] = 0.0f; angles[i] = 0.0f; }
+        return;
+    }
+
+    const double L = wheel_base_;      // 前后轴距 (2 * Lx)
+    const double W = track_width_;     // 左右轮距 (2 * Ly)
+    // manda V2.03: max_steer_angle 安全上限 45° (原 90° 是 atan 渐近边界,
+    // cos(90°)=0 轮速会爆 + 轮胎必然侧滑)。45° 时 R_min≈0.67m, 转弯稳。
+    const double max_steer_rad = max_steer_angle_ * M_PI / 180.0;
+    // 内部实际使用最大转角 = 配置值 (45° 时无需额外 hack; 代码仍保留 90° 时的
+    // 防护逻辑以防用户改回大角度)。
+    const double max_steer_rad_eff =
+        (max_steer_rad >= M_PI / 2.0 - 1e-6) ? (M_PI / 2.0 - 0.02) : max_steer_rad;
+
+    // 3. 计算后轴中心的目标转弯半径 R
+    // 约定：omega > 0 为左转，R > 0；omega < 0 为右转，R < 0
+    double R = vx / omega;
+
+    // 计算最小允许转弯半径 (由内侧前轮的最大转角决定)
+    // 注意: max_steer_angle=90° 时 tan→∞, L/tan→0, R_min→W/2 (约 0.19m)。
+    double R_min = L / std::tan(max_steer_rad_eff) + W / 2.0;
+
+    // 4. 曲率限幅 (如果指令要求的转弯半径太小，限制角速度)
+    if (std::abs(R) < R_min) {
+        R = (R > 0) ? R_min : -R_min;
+        omega = vx / R; // 等比例缩小角速度
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Steer angle exceeds %.1f deg! Limiting turning radius to %.2fm",
+            max_steer_angle_, R_min);
+    }
+
+    // ============================================================
+    // manda 修复 (V1.09): 纯阿克曼转角计算, 正确处理右转 (R<0)
+    // ------------------------------------------------------------
+    // 旧实现用 atan2(L, R_L) 直接算转角: 当 R<0 (右转) 时, R_L/R_R 均为负,
+    // atan2 落在第二象限 → 算出 >90° 的荒谬角度 (如 156°), 远超物理限位,
+    // 导致前轮猛打方向 + 车身颤抖。这正是导航"直行却猛打方向"的根因。
+    //
+    // 正确做法: 内侧/外侧前轮转角应关于 R 的符号对称。
+    //   左转 (R>0): delta_FL = +atan(L/r_inner) 内侧 > delta_FR = +atan(L/r_outer) 外侧
+    //   右转 (R<0): delta_FL = -atan(L/r_outer) 外侧 > delta_FR = -atan(L/r_inner) 内侧
+    // 这样右转 (R<0) 时转角为负, 左转 (R>0) 时转角为正, 且角度大小正确。
+    // 最后再对每个转角做 ±max_steer_angle 硬限幅, 物理上不可能超过。
+    // ============================================================
+    const double abs_R = std::abs(R);
+
+    // 内侧轮半径 = |R| - W/2 (靠近转弯中心), 需防除 0/负值
+    // 大转角时 abs_R 接近 W/2, r_inner 接近 0 → atan(L/r_inner) 接近 90°。
+    // 用 r_inner_min 钳制, 使 atan 结果不超过 max_steer_rad_eff。
+    double r_inner = abs_R - W / 2.0;
+    double r_outer = abs_R + W / 2.0;   // 外侧轮半径恒 > 0
+    // 由 atan(L / r) <= max_steer_rad_eff 反推 r 的下限:
+    double r_inner_min = L / std::tan(max_steer_rad_eff);
+    if (r_inner < r_inner_min) r_inner = r_inner_min;
+    if (r_inner < 0.05) r_inner = 0.05; // 最终防线, 防除 0
+
+    // 前轮转角 (带符号, 弧度): FL 与 FR 中, 靠近转弯中心的是内侧轮。
+    // 左转 (R>=0): 左侧(FL)是内侧轮 → |FL| > |FR|
+    // 右转 (R<0):  右侧(FR)是内侧轮 → |FR| > |FL|
+    double delta_FL;
+    double delta_FR;
+
+    if (R >= 0.0) {
+        // 左转：左前轮为内侧，右前轮为外侧
+        delta_FL = std::atan(L / r_inner);
+        delta_FR = std::atan(L / r_outer);
+    } else {
+        // 右转：右前轮为内侧，左前轮为外侧
+        delta_FL = -std::atan(L / r_outer);
+        delta_FR = -std::atan(L / r_inner);
+    }
+
+    // 硬限幅到物理转向角范围 [-max_steer_angle, +max_steer_angle]
+    delta_FL = std::max(-max_steer_rad, std::min(max_steer_rad, delta_FL));
+    delta_FR = std::max(-max_steer_rad, std::min(max_steer_rad, delta_FR));
+
+    // 6. 计算四个车轮的线速度
+    // 后轮 (直行轮) 速度 = 角速度 * 各自半径 (带符号, 倒车自动为负)
+    speeds[1] = static_cast<float>(omega * (R - W / 2.0)); // RL
+    speeds[3] = static_cast<float>(omega * (R + W / 2.0)); // RR
+
+    // 前轮速度 = 后轮速度 / cos(转角)。大转角时 cos→0 会使轮速放大。
+    // cos 下限对应 ~88.85° (与 max_steer_rad_eff 一致), 防除 0。
+    const double cos_FL = std::max(std::cos(delta_FL), std::cos(max_steer_rad_eff));
+    const double cos_FR = std::max(std::cos(delta_FR), std::cos(max_steer_rad_eff));
+    speeds[0] = static_cast<float>(speeds[1] / cos_FL); // FL
+    speeds[2] = static_cast<float>(speeds[3] / cos_FR); // FR
+
+    // ---- 单轮速度上限: 整组等比缩放, 保持阿克曼几何一致性 ----
+    // 大转角 (接近90°) 时前轮线速度 = 后轮速度 / cos(δ) 会被显著放大,
+    // 若某个轮速超过 max_wheel_speed_, 将所有轮速等比缩小, 避免下发超速。
+    // 这样运动学比例不变 (仍是正确阿克曼), 只是整体减速。
+    double max_spd = 0.0;
+    for (int i = 0; i < 4; i++)
+        max_spd = std::max(max_spd, static_cast<double>(std::abs(speeds[i])));
+    if (max_spd > max_wheel_speed_) {
+        double k = max_wheel_speed_ / max_spd;   // 0 < k < 1
+        for (int i = 0; i < 4; i++) speeds[i] = static_cast<float>(speeds[i] * k);
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Wheel speed limited: max %.2f m/s > %.2f, scaled all by %.2f",
+            max_spd, max_wheel_speed_, k);
+    }
+
+    // 转换为角度 (度)
+    angles[0] = static_cast<float>(delta_FL * 180.0 / M_PI); // FL
+    angles[2] = static_cast<float>(delta_FR * 180.0 / M_PI); // FR
+}
+
+// ============================================================
+// manda V2.07: 转向就绪判定
+// ------------------------------------------------------------
+// 检查 0x102 反馈的前轮实际转角是否接近目标转角。
+// 仅检查两个前轮 (index 0=FL, 2=FR), 后轮转角恒为 0 不参与。
+// 误差 < steer_ready_tolerance_ (度) 才算"就绪", 连续满足
+// steer_ready_frames_ 帧后返回 true。
+// ============================================================
+bool MandaCanBridge::isSteerReady() {
+    // 直行 (无转向请求) 永远就绪
+    const bool straight =
+        std::abs(target_vz_) < 1e-5f || std::abs(target_vx_) < 0.01f;
+    if (straight) {
+        return true;
+    }
+
+    const double tol = steer_ready_tolerance_;  // 度
+    const double err_fl = std::abs(state_.steer_angle[0] - target_angles_[0]);
+    const double err_fr = std::abs(state_.steer_angle[2] - target_angles_[2]);
+
+    if (err_fl < tol && err_fr < tol) {
+        if (steer_ok_counter_ < 1000) steer_ok_counter_++;
+    } else {
+        steer_ok_counter_ = 0;
+    }
+
+    return steer_ok_counter_ >= steer_ready_frames_;
+}
+
+// ============================================================
+// manda V2.07: 速度斜坡
+// ------------------------------------------------------------
+// 每轮调用, 将当前实际下发速度从 ramp_current_speed_ 向目标速度
+// 逼近, 每次最多变化 max_wheel_accel_ * dt, 避免 0→目标速度的瞬跳。
+// 斜坡同时作用于四个轮 (按比例), 保持阿克曼几何一致性。
+// ============================================================
+void MandaCanBridge::applySpeedRamp(float speeds[4], float target_speeds[4], double dt) {
+    if (dt <= 0.0) dt = 0.1;
+
+    const double step = max_wheel_accel_ * dt;   // 每轮最多变化量 (m/s)
+    const bool any_motion =
+        std::abs(target_vx_) > 0.01f || std::abs(target_vz_) > 0.01f;
+
+    // 无运动请求 → 立即归零停车 (不斜坡减速, 保证安全停车)
+    if (!any_motion) {
+        ramp_current_speed_ = 0.0;
+        ramp_active_ = false;
+        for (int i = 0; i < 4; i++) speeds[i] = 0.0f;
+        return;
+    }
+
+    // 计算目标最大轮速 (用于归一化斜坡)
+    double max_target = 0.0;
+    for (int i = 0; i < 4; i++)
+        max_target = std::max(max_target, std::abs(static_cast<double>(target_speeds[i])));
+    if (max_target < 1e-4) {
+        // 目标基本为 0, 直接归零
+        ramp_current_speed_ = 0.0;
+        ramp_active_ = false;
+        for (int i = 0; i < 4; i++) speeds[i] = 0.0f;
+        return;
+    }
+
+    // 斜坡爬升 (只在加速方向限制; 减速直接跟随目标, 保证及时停车)
+    if (!ramp_active_) {
+        ramp_active_ = true;
+        ramp_current_speed_ = 0.0;
+    }
+
+    if (ramp_current_speed_ < max_target) {
+        ramp_current_speed_ += step;
+        if (ramp_current_speed_ > max_target) ramp_current_speed_ = max_target;
+    } else if (ramp_current_speed_ > max_target) {
+        // 目标变小 (减速), 直接跟随, 不限制减速率 (安全优先)
+        ramp_current_speed_ = max_target;
+    }
+
+    const double scale = ramp_current_speed_ / max_target;
+    for (int i = 0; i < 4; i++) {
+        speeds[i] = static_cast<float>(target_speeds[i] * scale);
+    }
+}
+// ============================================================
+// [LEGACY 0x08 段结束] 以下恢复为 V2.08 正常运行路径
+// ============================================================
+
+// ============================================================
+// 【已注释】原 4WS (四轮转向) 实现 — 保留对照, 不再使用
+// 物理谬误: 给后轮也计算了转向角, ICR 设在车体几何中心, 非纯阿克曼
+// ============================================================
+// void MandaCanBridge::computeAckermannKinematics(float vx, float omega,
+//                                                 float speeds[4], float angles[4]) {
+//     const double Lx = wheel_base_x_;
+//     const double Ly = wheel_base_y_;
+//     const double max_steer_rad = max_steer_angle_ * M_PI / 180.0;
+//     const double halfPi = M_PI / 2.0;
+//
+//     // 原地旋转保护: vx≈0 且 omega≠0 时纯阿克曼无法表达, 拒绝
+//     constexpr double kMinLinearSpeed = 0.01;
+//     if (std::abs(vx) < kMinLinearSpeed && std::abs(omega) > 1e-6) {
+//         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+//             "Ackermann: in-place rotation rejected (vx=%.3f, wz=%.3f), output zero.",
+//             vx, omega);
+//         for (int i = 0; i < 4; i++) { speeds[i] = 0.0f; angles[i] = 0.0f; }
+//         return;
+//     }
+//
+//     const double wx[4] = { Lx, -Lx,  Lx, -Lx};  // FL, RL, FR, RR
+//     const double wy[4] = { Ly,  Ly, -Ly, -Ly};  // FL, RL, FR, RR
+//
+//     for (int i = 0; i < 4; i++) {
+//         double xi = wx[i];
+//         double yi = wy[i];
+//
+//         double vx_wheel = static_cast<double>(vx) - static_cast<double>(omega) * yi;
+//         double vy_wheel = static_cast<double>(omega) * xi;
+//
+//         double delta = std::atan2(vy_wheel, vx_wheel);
+//         if (delta >  halfPi) delta -= M_PI;
+//         else if (delta < -halfPi) delta += M_PI;
+//
+//         if (delta >  max_steer_rad) delta =  max_steer_rad;
+//         if (delta < -max_steer_rad) delta = -max_steer_rad;
+//
+//         double speed = vx_wheel * std::cos(delta) + vy_wheel * std::sin(delta);
+//
+//         angles[i] = static_cast<float>(delta * 180.0 / M_PI);
+//         speeds[i] = static_cast<float>(speed);
+//     }
+// }
+
+// ============================================================
+// CAN 基础发送
+// ============================================================
+bool MandaCanBridge::sendFrame(const struct can_frame &frame) {
+    if (can_socket_ < 0) {
+        return false;
+    }
+
+    // ============================================================
+    // manda V2.06.1: 统一发送门控 (唯一出口)
+    // ------------------------------------------------------------
+    // 0x401~0x404 全部是运动相关帧, 必须满足:
+    //   1) 已确认控制权 (收到过 0x100);
+    //   2) 控制权在 CAN 手里 (Byte[1]==0x02 指令控制);
+    //   3) 未处于人工接管锁存态。
+    // 任一不满足则直接丢弃, 不发送。
+    //
+    // 为什么收敛到 sendFrame:
+    //   构造函数/看门狗/析构函数/接收线程都可能触发发送, 逐个加判定容易漏;
+    //   放在唯一出口后, 即使其他线程发生竞态, 也不可能在遥控接管期间
+    //   发出运动帧。
+    //
+    // 例外说明: 0x401 本身也走这里。WAIT_CONTROL 期间不发 401 是有意的 ——
+    //   必须先确认控制权, 才谈得上切运动模式。
+    // ============================================================
+    if (!allowMotionTx()) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+            "[TX-GATE] 丢弃运动帧 0x%03X (控制权未确认/非指令模式/人工接管中) "
+            "control_known=%d control_mode=0x%02X remote_override=%d",
+            frame.can_id,
+            static_cast<int>(control_mode_known_.load()),
+            control_mode_.load(),
+            static_cast<int>(remote_override_.load()));
+        return false;
+    }
+
+    int nbytes = write(can_socket_, &frame, sizeof(struct can_frame));
+    if (nbytes != static_cast<int>(sizeof(struct can_frame))) {
+        RCLCPP_WARN(this->get_logger(), "CAN send failed (id=0x%03x)", frame.can_id);
+        return false;
+    }
+    return true;
+}
+
+bool MandaCanBridge::sendWheelSpeeds(float v_fl, float v_rl, float v_fr, float v_rr) {
+    struct can_frame frame;
+    frame.can_id = 0x403;
+    frame.can_dlc = 8;
+    speedToCanBytes(v_fl, frame.data[0], frame.data[1]);
+    speedToCanBytes(v_rl, frame.data[2], frame.data[3]);
+    speedToCanBytes(v_fr, frame.data[4], frame.data[5]);
+    speedToCanBytes(v_rr, frame.data[6], frame.data[7]);
+    return sendFrame(frame);
+}
+
+bool MandaCanBridge::sendSteerAngles(float a_fl, float a_rl, float a_fr, float a_rr) {
+    struct can_frame frame;
+    frame.can_id = 0x404;
+    frame.can_dlc = 8;
+    angleToCanBytes(a_fl, frame.data[0], frame.data[1]);
+    angleToCanBytes(a_rl, frame.data[2], frame.data[3]);
+    angleToCanBytes(a_fr, frame.data[4], frame.data[5]);
+    angleToCanBytes(a_rr, frame.data[6], frame.data[7]);
+    return sendFrame(frame);
+}
+
+bool MandaCanBridge::sendAckermannCommand(float speeds[4], float angles[4]) {
+    bool ok = sendWheelSpeeds(speeds[0], speeds[1], speeds[2], speeds[3]);
+    ok = sendSteerAngles(angles[0], angles[1], angles[2], angles[3]) && ok;
+    return ok;
+}
+
+// ============================================================
+// manda V2.06: 0x401 运动模式切换
+//   0x08 = 用户自主控制 (Ackermann: 0x403/0x404)
+//   0x04 = 自旋转模式 (只收 0x402 的 Vz, VCU 自动摆四轮)
+// 切换后需保持静默 >= mode_switch_silence_ms_ (协议要求 200ms)
+// manda V2.08: 正常路径只发 0x01 (前后轮阿克曼); 0x04 仅作为兜底
+// ============================================================
+// ============================================================
+// manda V2.18: 切换到 0x01 前后轮阿克曼 (本车唯一的运动模式)
+// ------------------------------------------------------------
+// 【原地自旋 0x04 已被彻底移除, 且此接口不再接受任何模式参数】
+//   早期版本是 sendModeSwitch(uint8_t mode), 靠"拒绝 0x04"来保证安全;
+//   那仍然留下了一个"传入任意模式"的入口。
+//   现在改为无参形式: 帧内容在函数内部写死为 0x01,
+//   调用方无法传入 0x04 / 0x02 / 0x08 等任何其它值 ——
+//   不是"被拒绝", 而是根本"构造不出来"。
+// 时序要求: 发出前后需保持 >= mode_switch_silence_ms_ 的完全静默
+//   (协议要求 200ms; 静默期内发 0x402 会让底盘放弃模式切换)。
+// ============================================================
+bool MandaCanBridge::sendModeSwitch(uint8_t target_mode) {
+    // ★ 2026-09-28: 带目标模式的 0x401。仅允许 0x01 / 0x04。
+    //   0x02/0x08/0x10 不允许从控制器主动请求 —— 它们只可能来自遥控器。
+    if (!manda_mode::isRequestedMode(target_mode)) {
+        RCLCPP_ERROR(this->get_logger(),
+            "[MODE-REQUEST] 非法目标模式 0x%02X (仅允许 0x01/0x04), 拒绝发送",
+            target_mode);
+        return false;
+    }
+
+    struct can_frame frame{};
+    frame.can_id = 0x401;
+    frame.can_dlc = 1;
+    frame.data[0] = target_mode;
+
+    const bool ok = sendFrame(frame);
+    if (ok) {
+        // 静默期基准: 本帧发出后 >= mode_switch_silence_ms_ 不得再发任何帧
+        mode_cmd_sent_ts_ = std::chrono::steady_clock::now();
+        RCLCPP_INFO(this->get_logger(),
+            "[MODE-REQUEST] 0x401 Byte0=0x%02X (%s)",
+            target_mode,
+            target_mode == manda_mode::SPIN ? "SPIN 原地自旋" : "前后轮阿克曼");
+    }
+    return ok;
+}
+
+// ============================================================
+// manda V2.17: 0x402 整车速度控制 —— 本车【唯一】的运动指令出口
+// ------------------------------------------------------------
+// 协议 V1.24: DLC=8, Vx/Vy/Vz 均为 int16 (m/s ×1000 与 rad/s ×1000),
+//             Byte[6]/Byte[7] 为预留 (填 0)。
+//   0x01 前后轮阿克曼: VCU 只认 Vx 与 Vz (Vy 必须为 0)
+//   0x08 用户逐轮控制: 本帧无效 (那个模式用 0x403/0x404)
+// 注: 协议里的 0x02 斜移 / 0x04 自旋本车不使用;
+//     模式切换只有无参的 sendAckermannModeSwitch() 一个入口。
+//
+// ---- 阿克曼运动约束 (在 CAN 最终出口强制执行) ----
+// 只有前后轮阿克曼一种运动方式, 数学上可接受的速度组合为:
+//     |Vx| >= min_moving_speed  →  |Vz| <= |Vx| / R_min   (沿圆弧行驶)
+//     |Vx| <  min_moving_speed  →  Vx = 0 且 Vz = 0       (停车)
+// 被禁止的只有 "Vx=0 且 Vz≠0" (原地旋转), 因为阿克曼几何下前轮
+//   必须依靠车身前进才能产生横摆, 静止时无论怎么打方向盘都不会转。
+//
+// 为何要放在这一层 (而不是只靠 cmdVelCallback):
+//   cmdVelCallback 只能检查"刚收到的指令"。velocityLoop 里还有一层
+//   加速度斜坡 approach(): 减速时 cmd_vx_ 从 0.10 依次经过
+//   0.005 / 0.002 / ... 趋近 0, 若此刻 cmd_vz_ 仍为 0.10, 就会拼出
+//   一帧 "Vx≈0 且 Vz≠0"。在本函数(0x402 唯一出口)整形, 可保证
+//   不论指令来自 MPPI / 行为树 / 速度斜坡 / 调试脚本,
+//   总线上绝不会出现会引起原地旋转的速度组合。
+//
+// ⚠ 绝不能把 Vz 一律置零 —— 那会连正常拐弯一起干掉。
+//   这里只是在 |Vx| 足够时按 R_min 限制 |Vz|, 在 |Vx| 太小时才归零。
+// ============================================================
+bool MandaCanBridge::sendVelocityCommand(float vx, float vy, float vz) {
+    // ============================================================
+    // ★ 2026-09-28: 0x04 自旋态跳过阿克曼低速判断 ★
+    // ------------------------------------------------------------
+    // 0x04 下协议只认 0x402 的 Vz (VCU 自动摆四轮做原地自旋),
+    // 因此 Vx 必然为 0 —— 若走下面的 min_moving_speed_ 分支,
+    // 会把要发的 Vz 一并归零, 车就永远转不起来。
+    // 这里单独短路, 并做 max_spin_angular_vel_ 硬限幅。
+    // ============================================================
+    if (motion_state_ == MotionState::ACTIVE_04) {
+        const float spin_wz = std::clamp(
+            vz,
+            -static_cast<float>(max_spin_angular_vel_),
+             static_cast<float>(max_spin_angular_vel_));
+
+        struct can_frame sf;
+        sf.can_id = 0x402;
+        sf.can_dlc = 8;
+        speedToCanBytes(0.0f, sf.data[0], sf.data[1]);   // Vx = 0
+        speedToCanBytes(0.0f, sf.data[2], sf.data[3]);   // Vy = 0
+        speedToCanBytes(spin_wz, sf.data[4], sf.data[5]); // Vz = 自旋角速度
+        sf.data[6] = 0;
+        sf.data[7] = 0;
+        return sendFrame(sf);
+    }
+
+    const float abs_vx = std::abs(vx);
+
+    if (abs_vx < static_cast<float>(min_moving_speed_)) {
+        if (std::abs(vz) > 1e-6f) {
+            // |Vx| 低于最低行驶速度: 归零 + 停止。
+            // ⚠ 日志措辞说明 (2026-09-28 修正):
+            //   这里被拦下的大多【不是】真正意义的原地旋转请求, 而是
+            //   MPPI 为“微调航向”产生的极低速阿克曼圆弧, 如
+            //       (vx=0.0002, wz=0.0004) -> R = vx/wz = 0.50m —— 几何上完全合法,
+            //   只是 |Vx| 已低于 min_moving_speed, 车辆物理上走不出这条曲线。
+            //   真正的原地旋转 (vx=0, wz≣0) 已改由 spin_intent 通路处理:
+            //   它会在入口层被识别 -> 切 0x04 -> 走上面的 ACTIVE_04 短路。
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "[ACKERMANN-STOP] 低速阿克曼命令归零: |Vx|=%.4f < %.4f (wz=%.4f, "
+                "若 Vx≠0 则 R=%.3fm 几何合法; 真自旋需经 spin_intent 切 0x04)",
+                static_cast<double>(abs_vx), min_moving_speed_,
+                static_cast<double>(vz),
+                std::abs(vz) > 1e-9f
+                    ? static_cast<double>(abs_vx / std::abs(vz)) : 0.0);
+        }
+        vx = 0.0f;
+        vy = 0.0f;
+        vz = 0.0f;
+    } else {
+        // |Vx| 足够: 按 R >= R_min 限制 |Vz| (走圆弧, 保留正常转弯能力)
+        const float max_curve_wz =
+            static_cast<float>(abs_vx / native_min_turning_radius_);
+        if (std::abs(vz) > max_curve_wz) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "[ACKERMANN-CURVE] |Vz| %.4f -> %.4f (Vx=%.4f, R_min=%.2fm)",
+                static_cast<double>(std::abs(vz)),
+                static_cast<double>(max_curve_wz),
+                static_cast<double>(vx), native_min_turning_radius_);
+            vz = (vz > 0.0f) ? max_curve_wz : -max_curve_wz;
+        }
+        vy = 0.0f;   // 阿克曼无横向速度
+    }
+
+    struct can_frame frame;
+    frame.can_id = 0x402;
+    frame.can_dlc = 8;   // 协议 V1.24: DLC=8, Byte6/Byte7 为预留
+    speedToCanBytes(vx, frame.data[0], frame.data[1]);
+    speedToCanBytes(vy, frame.data[2], frame.data[3]);
+    speedToCanBytes(vz, frame.data[4], frame.data[5]);
+    frame.data[6] = 0;
+    frame.data[7] = 0;
+    return sendFrame(frame);
+}
+
+// ============================================================
+// manda V2.17: 运动状态机 —— 纯前后轮阿克曼 (只使用 0x01)
+// ------------------------------------------------------------
+// 时序规范:
+//   WAIT_CONTROL      : 等 0x100 Byte[1]==0x02, 一个字节都不发
+//   PREPARE_01        : 静默满 250ms → 0x401#01 → WAIT_01
+//   WAIT_01           : 等 0x104=(01,00) 且静默期满 → ACTIVE_01; 超时 → 恢复
+//   ACTIVE_01         : 周期下发 0x402(Vx, 0, Vz)   ← 唯一的运动状态
+//   PREPARE_RETURN_01 : 静默 250ms → 0x401#01 → WAIT_01 (异常恢复兜底)
+//   REMOTE_OVERRIDE   : 人工接管, 完全静默, 不抢控制权
+//   MODE_ERROR        : 自动恢复预算耗尽, 锁存静默, 需人工重启/交还控制权
+// 【已删除】原 PREPARE_SPIN_04 / WAIT_SPIN_04 / AUTO_SPIN_04 /
+//   EXIT_GRACE_04 四个状态 (0x04 原地自旋), 详见文件末尾说明。
+// 核心原则: 任何 0x401 前后必须保证 >= mode_switch_silence_ms_ 的完全静默,
+//           否则模式切换会被正在发送的 0x402 打断 (实测已确认)。
+// ============================================================
+namespace {
+inline double steadyElapsedMs(const std::chrono::steady_clock::time_point &from) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - from).count();
+}
+
+// 底盘上报模式 → 人类可读名称 (仅用于日志)
+// 只命名本车真正可能遇到的模式。
+// 【0x04 必须在此列出】2026-09 实测确认 VCU 支持 0x04 自旋; 若此处漏掉,
+//   自旋链路的所有 [MODE] 日志都会退化成 "(unexpected)", 极难排查。
+//   注: 兜底分支 default 保留, 用于捕捉 0x02 蟹行等非预期接管态。
+inline const char *modeName(uint8_t mode) {
+    switch (mode) {
+        case manda_mode::FRONT_REAR_ACKERMANN: return "0x01 front/rear Ackermann";
+        case manda_mode::CRAB:                 return "0x02 crab";
+        case manda_mode::SPIN:                 return "0x04 spin";
+        case manda_mode::INDIVIDUAL:           return "0x08 individual";
+        case manda_mode::PARK:                 return "0x10 park";
+        default:                               return "unexpected";
+    }
+}
+}  // namespace
+
+// ============================================================
+// 进入新状态: 统一复位状态计时器
+// ------------------------------------------------------------
+// 所有状态迁移都必须经过这里, 避免某条分支忘记更新 state_enter_ts_
+// 而让静默计时/超时判定基于一个陈旧的时间戳。
+// ============================================================
+void MandaCanBridge::enterState(MotionState s) {
+    motion_state_ = s;
+    state_enter_ts_ = std::chrono::steady_clock::now();
+    // 2026-09-28: 新增状态标志复位, 供 0x04 流程使用
+    zero_frame_sent_ = false;
+    mode_confirmed_ = false;
+}
+
+// ============================================================
+// 反馈静止判定 (用于切模式前的"车已停稳"门控)
+// ------------------------------------------------------------
+// 0x104 上报的 motion_vx/vy/vz 是底盘实际运动速度。
+// 阈值 0.01 略大于反馈量化步长, 又远小于任何有效行驶速度。
+// ============================================================
+bool MandaCanBridge::feedbackStopped() const {
+    return std::abs(state_.motion_vx) < 0.01f &&
+           std::abs(state_.motion_vy) < 0.01f &&
+           std::abs(state_.motion_vz) < 0.01f;
+}
+
+// ============================================================
+// 按"底盘当前实际模式"发送匹配的零速停车帧
+// ------------------------------------------------------------
+// 应用场景: 退出运行态、模式异常、人工接管前的最后停车。
+// 必须按底盘真实模式选帧型, 用错帧型会被底盘忽略, 导致停不下来:
+//   0x08 用户逐轮控制 → 0x403 四轮线速度全 0
+//   其它 (含 0x01 / 未知)  → 0x402 整车速度 Vx=Vy=Vz=0
+// 注意: 调用方需已持 velocity_mutex_, 且控制权仍在 CAN (allowMotionTx)。
+// ============================================================
+void MandaCanBridge::sendZeroForConfirmedMode(uint8_t mode) {
+    if (!allowMotionTx()) {
+        return;   // 控制权已不在 CAN 手里, 不可再发任何运动帧
+    }
+
+    if (mode == manda_mode::INDIVIDUAL) {
+        // 用户逐轮控制 (LEGACY): 四轮线速度清零
+        sendWheelSpeeds(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+        // 0x01 前后轮阿克曼 (以及任何其它值): 整车速度清零 (0x402)
+        // V2.17: 不再区分 0x02/0x04 —— 它们不是本车会进入的模式,
+        //        统一用 0x402 停车是最安全的做法。
+        sendVelocityCommand(0.0f, 0.0f, 0.0f);
+    }
+}
+
+// ============================================================
+// 模式异常/切换失败时的统一恢复入口
+// ------------------------------------------------------------
+// 处理: 先按实际模式发零速停车 → 进 PREPARE_RETURN_01 静默 250ms
+//       → 发一次 0x401#01 → WAIT_01
+// 预算限制: resync_retry_count_ 与 MODE_ERROR 共享同一预算, 避免
+//   "异常 → 恢复 → 再异常" 在遥控器残留模式时变成无限循环。
+// ============================================================
+void MandaCanBridge::scheduleRecoveryTo01(const char *reason, uint8_t observed_mode) {
+    // 先停止一切速度输出 (按底盘实际模式选帧型)
+    if (motion_state_ == MotionState::ACTIVE_01) {
+        sendZeroForConfirmedMode(observed_mode);
+    }
+
+    mode_mismatch_streak_ = 0;
+    cmd_vx_ = 0.0f;
+    cmd_vz_ = 0.0f;
+
+    if (resync_retry_count_ >= kMaxAutoRecovery) {
+        enterState(MotionState::MODE_ERROR);
+        RCLCPP_ERROR(this->get_logger(),
+            "[MODE] %s (0x104 报 0x%02X %s): 自动恢复预算已用尽 %d/%d "
+            "-> MODE_ERROR 锁存, 保持静默, 需人工重启或交还控制权",
+            reason, observed_mode, modeName(observed_mode),
+            resync_retry_count_, kMaxAutoRecovery);
+        return;
+    }
+
+    ++resync_retry_count_;
+    enterState(MotionState::PREPARE_RETURN_01);
+    RCLCPP_WARN(this->get_logger(),
+        "[MODE] %s (0x104 报 0x%02X %s): 停发速度 -> 静默 %.0fms -> 0x401#01 "
+        "(消耗自动恢复预算 %d/%d)",
+        reason, observed_mode, modeName(observed_mode),
+        mode_switch_silence_ms_, resync_retry_count_, kMaxAutoRecovery);
+}
+
+// ============================================================
+// 0x104 反馈处理: 模式确认 + 稳定态模式异常检测
+// ------------------------------------------------------------
+// 只在"稳定态"检查模式是否与预期一致:
+//   ACTIVE_01 期望 0x01 (本车唯一运动模式)
+// 切换过程中的过渡帧 (WAIT_01 里先看到旧的 0x08 等) 是正常的, 不能误判。
+// 非预期模式 (典型: 遥控器按过模式键留下的 0x02 斜移 / 0x08 逐轮 / 0x10 驻车)
+//   若继续按错误预期发帧会造成意外运动, 因此必须停车并恢复 0x01。
+// ============================================================
+void MandaCanBridge::onModeFeedback(uint8_t mode, uint8_t switch_flag) {
+    // 由 canReceiveLoop 的 0x104 处理调用 (调用处需持 velocity_mutex_)
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+        "[MODE] feedback=0x%02X (%s) flag=%d state=%d",
+        mode, modeName(mode), switch_flag, static_cast<int>(motion_state_));
+
+    const bool confirmed = (switch_flag == 0x00);
+    // 0x401 发出后的静默期必须已满, 只接受 401 发出之后的新反馈
+    const bool silence_done =
+        steadyElapsedMs(mode_cmd_sent_ts_) >= mode_switch_silence_ms_;
+
+    // ============================================================
+    // 稳定态的模式迁移 + 异常计数  (manda V2.18: 纯 0x01 阿克曼)
+    // ------------------------------------------------------------
+    // 通用规则: 本车只支持 0x01 前后轮阿克曼。
+    //   ACTIVE_01 下底盘报的只要不是 0x01, 一律计为异常, 随后恢复 0x01。
+    //   这里【不再为任何具体模式写特例】—— 原 V2.17 曾把 0x04 单独列出
+    //   并立即恢复, 现在该分支已删除, 0x04 与 0x02/0x08/0x10 走完全相同的
+    //   通用路径, 代码中不存在任何指向 0x04 的符号。
+    // 为何保留"连续 N 帧确认"而不直接单帧恢复:
+    //   0x104 约 100Hz 上报, 0x401 切换刚结束的边缘可能夹带 1~2 帧旧值;
+    //   单帧就恢复会把宝贵的自动恢复预算 (kMaxAutoRecovery=2) 浪费在
+    //   噪声上, 一旦耗尽就锁存 MODE_ERROR 需人工重启。
+    //   3 帧 @100Hz = 30ms, 而 0x402 下发周期为 100ms, 反应仍然充分。
+    // 切换过程中的过渡态 (WAIT_01 / PREPARE_* / REMOTE_OVERRIDE /
+    //   MODE_ERROR / WAIT_CONTROL) 不做异常判定, 过渡帧是正常的。
+    // ============================================================
+    switch (motion_state_) {
+        case MotionState::ACTIVE_01: {
+            if (!confirmed) {
+                break;
+            }
+            if (mode == manda_mode::FRONT_REAR_ACKERMANN) {
+                // 期望模式
+                mode_mismatch_streak_ = 0;
+            } else {
+                // 非前后轮阿克曼 (含意外 0x04): 计入异常, 连续 N 帧后恢复 0x01
+                mode_mismatch_streak_ = (mode_mismatch_streak_ < 255)
+                                            ? static_cast<uint8_t>(mode_mismatch_streak_ + 1)
+                                            : 255;
+            }
+            break;
+        }
+        case MotionState::WAIT_01: {
+            if (mode == manda_mode::FRONT_REAR_ACKERMANN && confirmed && silence_done) {
+                enterState(MotionState::ACTIVE_01);
+                resync_retry_count_ = 0;   // 确认落定 → 恢复预算回满
+                mode_mismatch_streak_ = 0;
+                RCLCPP_INFO(this->get_logger(),
+                    "[MODE] 0x01 (前后轮阿克曼) confirmed -> ACTIVE_01");
+            }
+            break;
+        }
+
+        // --------------------------------------------------------
+        // ★ 0x04 自旋通路 (2026-09-28 恢复) ★
+        //   这两个状态下 0x04 是【期望模式】, 必须接受而不能当异常。
+        //   若沿用旧逻辑 (非 0x01 一律计异常), 切过去约 30ms 就会被
+        //   拉回 0x01 —— 车永远转不起来。
+        // --------------------------------------------------------
+        case MotionState::WAIT_04: {
+            if (mode == manda_mode::SPIN && confirmed && silence_done) {
+                enterState(MotionState::ACTIVE_04);
+                resync_retry_count_ = 0;
+                mode_mismatch_streak_ = 0;
+                RCLCPP_INFO(this->get_logger(),
+                    "[MODE-ACTIVE] 0x04 原地自旋 已确认 -> ACTIVE_04");
+            }
+            break;
+        }
+        case MotionState::ACTIVE_04: {
+            if (!confirmed) {
+                break;
+            }
+            if (mode == manda_mode::SPIN) {
+                mode_mismatch_streak_ = 0;   // 期望模式
+            } else if (mode == manda_mode::FRONT_REAR_ACKERMANN) {
+                // 底盘自己回到了 0x01 (例如固件超时) —— 不是错误,
+                // 但必须同步状态, 否则会继续向 0x01 发 "0x04 的 Vz"。
+                RCLCPP_WARN(this->get_logger(),
+                    "[MODE] 自旋中底盘自行回到 0x01 -> 同步为 ACTIVE_01");
+                pending_spin_wz_ = 0.0;
+                spin_enter_counter_ = 0;
+                spin_exit_counter_ = 0;
+                enterState(MotionState::ACTIVE_01);
+            } else {
+                // 意外进入 0x02/0x08/0x10: 计异常, 连续 N 帧后回到 0x01
+                mode_mismatch_streak_ = (mode_mismatch_streak_ < 255)
+                                            ? static_cast<uint8_t>(mode_mismatch_streak_ + 1)
+                                            : 255;
+            }
+            break;
+        }
+        case MotionState::WAIT_RETURN_01: {
+            if (mode == manda_mode::FRONT_REAR_ACKERMANN && confirmed && silence_done) {
+                pending_spin_wz_ = 0.0;
+                last_spin_wz_ = 0.0;
+                enterState(MotionState::ACTIVE_01);
+                resync_retry_count_ = 0;
+                mode_mismatch_streak_ = 0;
+                RCLCPP_INFO(this->get_logger(),
+                    "[MODE-ACTIVE] 0x01 阿克曼 已恢复 -> ACTIVE_01");
+            }
+            break;
+        }
+
+        case MotionState::REMOTE_OVERRIDE:
+            // 遥控器接管期间可自由进入任意模式 (0x02/0x04 均非故障)。
+            // 只记录, 不干预、不计异常、不消耗恢复预算。
+            mode_mismatch_streak_ = 0;
+            break;
+
+        case MotionState::MODE_ERROR:
+            // 锁存态: 只能靠节点重启 / 控制权重新交还 (0x100 处理切回 PREPARE_01) 解除。
+            // 不接受单帧 0x104 自动解除 —— 那会让遥控器残留模式时反复跳锁。
+            break;
+        default:
+            // PREPARE_01 / PREPARE_04 / PREPARE_RETURN_01 / WAIT_CONTROL:
+            // 过渡态或静默态, 不做模式判定。
+            break;
+    }
+
+    // ---- 连续 N 帧异常确认 → 停车并恢复 0x01 ----
+    // 0x104 约 100Hz 上报, 切换刚结束的边缘可能出现 1~2 帧旧值;
+    // 单帧异常就恢复会把恢复预算浪费在噪声上。
+    // V2.18: 触发原因统一措辞 —— 不再为 0x04 写单独的提示语。
+    if (mode_mismatch_streak_ >= kModeMismatchConfirmFrames) {
+        scheduleRecoveryTo01("检测到非前后轮阿克曼模式", mode);
+    }
+}
+
+// ============================================================
+// [已移除] 所有原地自旋 (0x04) 实现 —— manda V2.17
+// ------------------------------------------------------------
+// 历史上本文件曾有两条自旋路径, 现全部删除:
+//   1) V2.06 的 8 状态自旋机 (SpinState / requestSpin / cancelSpin /
+//      onSpinModeFeedback / updateSpinStateMachine), 围绕 0x08 ↔ 0x04
+//      手工切换: 停 403/404 → 静默 → 0x401#04 → 0x402 发 Vz → 停 → 0x401#08
+//      完整旧实现见 src/manda_can_bridge.cpp.bak_v203_pre_spin。
+//   2) V2.08~V2.16 的 MotionState 自旋状态
+//      (PREPARE_SPIN_04 / WAIT_SPIN_04 / AUTO_SPIN_04 / EXIT_GRACE_04),
+//      依赖 "VCU 会依据 Vx≈0 且 Vz≠0 自行进入 0x04" 这一假设。
+//
+// 删除原因 (实测证据, 2026-09-17 现场抓包):
+//   · 底盘桥正确下发了 0x402(Vx=0, Vz≠0) 纯旋转指令
+//   · 但 0x104 的 mode 字段 749 帧全部为 0x01, VCU 从未进入 0x04
+//   · 0x01 阿克曼在 Vx=0 时物理上无法旋转 -> 车原地不动
+//   · Nav2 侧表现为 "Failed to make progress" 反复出现 + 反复 BackUp
+// 结论: 该假设不成立, 保留自旋路径只会让上游误以为"在转"而实际不动。
+// 现在仅保留 0x01 一条运动路径, 约束由 min_moving_speed +
+// native_min_turning_radius 完整描述。
+// ============================================================
+
+// ============================================================
+// manda V2.17: 运动状态机主循环
+// ------------------------------------------------------------
+// 调用约定: 由 velocityLoop 在持有 velocity_mutex_ 时调用。
+// 状态机自己负责在 ACTIVE_01 下发 0x402; 其余状态
+// (静默期 / 切换中 / 锁存 / 人工接管) 一个速度字节都不发。
+// ============================================================
+void MandaCanBridge::updateMotionStateMachine() {
+    const double since_enter_ms = steadyElapsedMs(state_enter_ts_);
+
+    // manda V2.17: 纯前后轮阿克曼 —— 状态机只有一条运动路径 (0x01)。
+    //   曾经在此解算的 "自旋意图 want_spin (Vx≈0 且 Vz≠0)" 及配套迟滞阈值
+    //   已随 0x04 一并删除。当前状态下不存在任何需要判断"该不该自旋"的分支:
+    //   所有速度指令都统一交给 sendVelocityCommand() → 0x402, 由该函数在
+    //   CAN 出口处施加 min_moving_speed / R_min 约束。
+
+    switch (motion_state_) {
+        // --------------------------------------------------------
+        case MotionState::WAIT_CONTROL: {
+            // 上电后先等控制权确认, 完全不发任何运动帧。
+            // 只有收到首帧 0x100 且 Byte[1]==0x02 (指令控制) 才推进。
+            // 若 Byte[1]!=0x02 (遥控/待机), 0x100 处理会把状态切到 REMOTE_OVERRIDE,
+            // 避免上电瞬间底盘仍在遥控器控制时抢先发送 0x401 争权。
+            if (control_mode_known_.load() && control_mode_.load() == 0x02) {
+                enterState(MotionState::PREPARE_01);
+                // 把静默基准往前推一个静默期, 使 PREPARE_01 的第一次判定
+                // 就满足 "静默已满" (构造函数后已过 250ms, 无需再等)。
+                mode_cmd_sent_ts_ = std::chrono::steady_clock::now()
+                    - std::chrono::milliseconds(static_cast<int64_t>(mode_switch_silence_ms_));
+                RCLCPP_INFO(this->get_logger(),
+                    "[MODE] 控制权确认(指令控制) -> PREPARE_01, 准备切 0x01");
+            }
+            break;
+        }
+
+        // --------------------------------------------------------
+        case MotionState::PREPARE_01: {
+            // 静默期: 一个字节都不发, 静默期满后发一次 0x401#01。
+            // 为什么必须静默: 实测切换 0x401 时若总线上还有 0x402 在发,
+            //   底盘会放弃模式切换, 0x104 保持旧模式直至超时。
+            if (since_enter_ms < mode_switch_silence_ms_) {
+                break;
+            }
+            if (sendAckermannModeSwitch()) {
+                mode_cmd_sent_ts_ = std::chrono::steady_clock::now();
+                enterState(MotionState::WAIT_01);
+                RCLCPP_INFO(this->get_logger(),
+                    "[MODE] 已发 0x401#01 (只发一次), 等 0x104 确认");
+            } else if (!allowMotionTx()) {
+                // 发送被门控拒绝 ≠ 发送失败, 两者必须分开处理:
+                //   a) 已被人工接管 → REMOTE_OVERRIDE (等控制权交还)
+                //   b) 控制权尚未确认 → 退回 WAIT_CONTROL (继续等 0x100)
+                if (remote_override_.load()) {
+                    enterState(MotionState::REMOTE_OVERRIDE);
+                    RCLCPP_WARN(this->get_logger(),
+                        "[MODE] 已被人工接管 -> REMOTE_OVERRIDE");
+                } else {
+                    enterState(MotionState::WAIT_CONTROL);
+                    RCLCPP_WARN(this->get_logger(),
+                        "[MODE] 控制权未确认 -> 退回 WAIT_CONTROL");
+                }
+            } else {
+                // 控制权仍在 CAN 手里, 是 write() 本身失败 (驱动/socket 异常)
+                enterState(MotionState::MODE_ERROR);
+                RCLCPP_ERROR(this->get_logger(),
+                    "[MODE] 控制权正常但 CAN 写失败 -> MODE_ERROR");
+            }
+            break;
+        }
+
+        // --------------------------------------------------------
+        case MotionState::WAIT_01: {
+            // 等 0x104=(01,00) + 静默期满 (onModeFeedback 负责确认)
+            if (since_enter_ms >= mode_switch_timeout_ms_) {
+                scheduleRecoveryTo01("等待 0x01 确认超时", state_.current_mode);
+            }
+            break;
+        }
+
+        // --------------------------------------------------------
+        case MotionState::ACTIVE_01: {
+            // 正常行驶 (唯一运动状态): 0x402 下发整车 Vx / Vz, Vy 恒 0。
+            // 加速度斜坡会让 cmd_vx_ 在减速时经过极小值, 若此刻 cmd_vz_ 仍
+            //   非零, sendVelocityCommand() 会在 CAN 出口把这一帧归零 ——
+            //   详见该函数的 [ACKERMANN-STOP] 说明。
+            const bool sent = sendVelocityCommand(cmd_vx_, 0.0f, cmd_vz_);
+            RCLCPP_DEBUG(this->get_logger(),
+                "[TX] 0x402 vx=%.3f vz=%.3f %s", cmd_vx_, cmd_vz_,
+                sent ? "OK" : "FAIL");
+            break;
+        }
+
+        // --------------------------------------------------------
+        // --------------------------------------------------------
+        // ★ 0x04 原地自旋接入流程 (2026-09-28) ★
+        // --------------------------------------------------------
+        case MotionState::PREPARE_04: {
+            // 第一步: 先发一次零速, 等车停稳再切模式。
+            // 为何必须停稳: 0x401 切换前若车仍在动, VCU 可能拒绝切换;
+            //   且切换期间禁止发非零速度 (协议要求静默)。
+            if (!zero_frame_sent_) {
+                sendVelocityCommand(0.0f, 0.0f, 0.0f);
+                zero_frame_sent_ = true;
+                state_enter_ts_ = std::chrono::steady_clock::now();
+                break;
+            }
+            // 等反馈静止 (或超时 200ms 兜底, 防止反馈一直不归零而卡死)
+            if (feedbackStopped() || since_enter_ms >= 200.0) {
+                if (sendModeSwitch(manda_mode::SPIN)) {
+                    enterState(MotionState::WAIT_04);
+                    RCLCPP_INFO(this->get_logger(),
+                        "[MODE-SWITCH] 零速已确认 -> 已发 0x401#04, 等确认");
+                } else if (!allowMotionTx()) {
+                    enterState(remote_override_.load()
+                                   ? MotionState::REMOTE_OVERRIDE
+                                   : MotionState::WAIT_CONTROL);
+                } else {
+                    enterState(MotionState::MODE_ERROR);
+                    RCLCPP_ERROR(this->get_logger(),
+                        "[MODE] 0x401#04 发送失败 -> MODE_ERROR");
+                }
+            }
+            break;
+        }
+
+        case MotionState::WAIT_04: {
+            // 等 0x104=(04,00) (onModeFeedback 负责确认并转 ACTIVE_04)
+            if (since_enter_ms >= mode_switch_timeout_ms_) {
+                scheduleRecoveryTo01("等待 0x04 确认超时", state_.current_mode);
+            }
+            break;
+        }
+
+        case MotionState::ACTIVE_04: {
+            // 自旋中: 只发 0x402(0, 0, Vz), 由 sendVelocityCommand 的
+            //   ACTIVE_04 分支处理 (跳过低速归零 + 做 spin 限幅)。
+            sendVelocityCommand(0.0f, 0.0f, pending_spin_wz_);
+            break;
+        }
+
+        // --------------------------------------------------------
+        case MotionState::PREPARE_RETURN_01: {
+            if (since_enter_ms < mode_switch_silence_ms_) {
+                break;   // 兜底恢复的静默窗口
+            }
+            if (sendAckermannModeSwitch()) {
+                mode_cmd_sent_ts_ = std::chrono::steady_clock::now();
+                // ★ 修正: 旧的去向是 WAIT_01, 但那个状态会把"确认 0x01"
+                //   与首次启动混淆。现在统一指向 WAIT_RETURN_01。
+                enterState(MotionState::WAIT_RETURN_01);
+                RCLCPP_INFO(this->get_logger(),
+                    "[MODE-REQUEST] 兜底恢复: 已发 0x401#01, 等确认");
+            } else if (!allowMotionTx()) {
+                // 与 PREPARE_01 同样区分"被门控拒绝"与"写失败":
+                // 被拒绝说明控制权已不在 CAN 手里, 不应消耗恢复预算。
+                if (remote_override_.load()) {
+                    enterState(MotionState::REMOTE_OVERRIDE);
+                    RCLCPP_WARN(this->get_logger(),
+                        "[MODE] 兜底恢复被人工接管打断 -> REMOTE_OVERRIDE");
+                } else {
+                    enterState(MotionState::WAIT_CONTROL);
+                    RCLCPP_WARN(this->get_logger(),
+                        "[MODE] 兜底恢复时控制权未确认 -> 退回 WAIT_CONTROL");
+                }
+            } else if (resync_retry_count_ >= kMaxAutoRecovery) {
+                enterState(MotionState::MODE_ERROR);
+                RCLCPP_ERROR(this->get_logger(),
+                    "[MODE] 兜底恢复 0x401#01 发送失败且预算耗尽 -> MODE_ERROR");
+            } else {
+                ++resync_retry_count_;
+                RCLCPP_WARN(this->get_logger(),
+                    "[MODE] 兜底恢复 0x401#01 发送失败, 重试 (%d/%d)",
+                    resync_retry_count_, kMaxAutoRecovery);
+            }
+            break;
+        }
+
+        case MotionState::WAIT_RETURN_01: {
+            // 等 0x104=(01,00) (onModeFeedback 负责确认并转 ACTIVE_01)
+            if (since_enter_ms >= mode_switch_timeout_ms_) {
+                scheduleRecoveryTo01("等待回 0x01 确认超时", state_.current_mode);
+            }
+            break;
+        }
+
+        // --------------------------------------------------------
+        case MotionState::REMOTE_OVERRIDE: {
+            // 人工接管中 —— 完全静默。
+            // 不发 401/402/403/404, 不做任何主动恢复 (不抢控制权)。
+            // 仅由 0x100 处理在控制权交还时切回 PREPARE_01。
+            // 这里只做节流告警, 让操作者知道软件已让出控制权。
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+                "[SAFETY] REMOTE_OVERRIDE active: 人工接管中, 已停止所有运动指令输出");
+            break;
+        }
+
+        // --------------------------------------------------------
+        case MotionState::MODE_ERROR: {
+            // 锁存态: 自动恢复预算已用尽, 保持静默, 不会再自动尝试切换。
+            // 解除途径只有两条:
+            //   1) 节点重启;
+            //   2) 控制权重新交还 (0x100 Byte[1] 回 0x02), 0x100 处理会把
+            //      状态置回 PREPARE_01 并清零预算。
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[MODE] MODE_ERROR 已锁存 (自动恢复预算已用尽 %d/%d): 保持静默, "
+                "需人工重启节点或交还控制权才能恢复",
+                resync_retry_count_, kMaxAutoRecovery);
+            break;
+        }
+    }
+}
+
+// ============================================================
+// cmd_vel 回调 (带倒车安全门)
+// ============================================================
+void MandaCanBridge::cmdVelCallback(
+    const geometry_msgs::msg::Twist::SharedPtr msg)
+{
+    last_cmd_time_ms_.store(steadyNowMs());
+    last_cmd_time_ = std::chrono::steady_clock::now();   // 看门狗用 (不依赖 ROS 时间)
+
+    std::lock_guard<std::mutex> lock(velocity_mutex_);
+
+    // ---- 实时读参数 (支持 ros2 param set 立即生效) ----
+    const bool allow_reverse = this->get_parameter("allow_reverse").as_bool();
+    const float max_reverse_speed = static_cast<float>(
+        std::max(0.0, this->get_parameter("max_reverse_speed").as_double()));
+    const bool enable_spin = this->get_parameter("enable_spin_mode").as_bool();
+    // ★【2026-09-28 修正】这两个阈值原先只在构造函数里读一次,
+    //   导致 `ros2 param set spin_wz_enter 0.05` 只改了参数服务器、
+    //   实际判定仍用旧值 -> 必须重启节点。现改为与 enable_spin_mode
+    //   一致的【实时读取】, 调参无需重启。
+    const double spin_vx_eps = this->get_parameter("spin_vx_epsilon").as_double();
+    const double spin_wz_enter =
+        std::max(1e-6, this->get_parameter("spin_wz_enter").as_double());
+    spin_wz_enter_ = spin_wz_enter;   // 同步到成员变量, 供日志/其它分支使用
+
+    const float raw_vx = static_cast<float>(msg->linear.x);
+    const float raw_vz = static_cast<float>(msg->angular.z);
+
+    // ============================================================
+    // ★★★ 纯旋转意图识别 —— 必须在任何低速死区【之前】 ★★★
+    // ------------------------------------------------------------
+    // 【为何顺序关键】底层的 min_moving_speed_ 归零会把
+    //     (vx=0, wz=0.12)  这种真自旋请求也一并抹成 (0,0),
+    //   那样 0x04 切换就永远不会触发。因此先在这里分流。
+    //
+    // 三类输入 (阈值默认 spin_vx_epsilon=0.002, spin_wz_enter=0.05):
+    //   spin_intent  : |vx|<=eps 且 |wz|>=enter  -> 申请 0x04
+    //   tiny_residual: |vx|<=eps 且 |wz|< enter   -> 静默归零, 绝不切模式
+    //   其它          : 正常阿克曼处理
+    //
+    // ⚠ spin_wz_enter 为何不能用很低的 0.005 (2026-09-28 实测):
+    //   接 RotationShim 后测 /cmd_vel_nav 862 帧:
+    //     微调残余 (|vx|≈0, 0.005<=|wz|<0.05) : 670 帧 中位 0.0154
+    //     真旋转   (|vx|≈0, |wz|>=0.05)       :   0 帧
+    //   低阈值会把 MPPI 的"到点微调残余"误判为旋转意图 -> 切 0x04 ->
+    //   0x04 下 Vx 被丢弃 -> 车只能缓慢自旋, 位置永不收敛 -> 死锁 ABORTED。
+    //   故取 0.05: 残余最大值 0.0281 < 0.05 < 0.12(Shim 真旋转)。
+    // ============================================================
+    const float abs_vx_raw = std::abs(raw_vx);
+    const bool spin_intent =
+        enable_spin &&
+        abs_vx_raw <= static_cast<float>(spin_vx_eps) &&
+        std::abs(raw_vz) >= static_cast<float>(spin_wz_enter);
+    const bool tiny_residual =
+        abs_vx_raw <= static_cast<float>(spin_vx_eps) &&
+        std::abs(raw_vz) < static_cast<float>(spin_wz_enter);
+
+    // ---- 非运动状态 (接管/故障): 不接受任何运动命令 ----
+    if (motion_state_ == MotionState::REMOTE_OVERRIDE ||
+        motion_state_ == MotionState::MODE_ERROR) {
+        target_vx_ = 0.0f;
+        target_vz_ = 0.0f;
+        return;
+    }
+
+    // ---- 切换中 (PREPARE_*/WAIT_*): 缓存意图但不立即执行 ----
+    if (motion_state_ != MotionState::ACTIVE_01 &&
+        motion_state_ != MotionState::ACTIVE_04) {
+        // 仅记录 0x04 目标角速度, 由状态机推进到 ACTIVE_04 后才使用
+        if (spin_intent) {
+            pending_spin_wz_ = std::clamp(raw_vz,
+                -static_cast<float>(max_spin_angular_vel_),
+                 static_cast<float>(max_spin_angular_vel_));
+        }
+        target_vx_ = 0.0f;
+        target_vz_ = 0.0f;
+        return;
+    }
+
+    // ============================================================
+    // ACTIVE_04: 已在自旋模式
+    // ------------------------------------------------------------
+    // 持续收到纯旋转 -> 更新目标角速度;
+    // 旋转意图消失或收到前进命令 -> 连续 N 帧后切回 0x01。
+    // ============================================================
+    if (motion_state_ == MotionState::ACTIVE_04) {
+        if (spin_intent) {
+            spin_exit_counter_ = 0;
+            pending_spin_wz_ = std::clamp(raw_vz,
+                -static_cast<float>(max_spin_angular_vel_),
+                 static_cast<float>(max_spin_angular_vel_));
+            last_spin_wz_ = pending_spin_wz_;
+            target_vx_ = 0.0f;
+            target_vz_ = pending_spin_wz_;
+            return;
+        }
+
+        // 意图消失: 停车并计数
+        target_vx_ = 0.0f;
+        target_vz_ = 0.0f;
+        ++spin_exit_counter_;
+
+        // 收到明显前进命令 -> 立即退出; 或连续 N 帧无意图 -> 退出
+        if (abs_vx_raw > static_cast<float>(spin_vx_epsilon_) ||
+            spin_exit_counter_ >= spin_exit_confirm_frames_) {
+            spin_exit_counter_ = 0;
+            pending_spin_wz_ = 0.0f;
+            enterState(MotionState::PREPARE_RETURN_01);
+            RCLCPP_INFO(this->get_logger(),
+                "[SPIN] 旋转结束 (vx=%.4f) -> 准备切回 0x01", raw_vx);
+        }
+        return;
+    }
+
+    // ============================================================
+    // ACTIVE_01: 正常阿克曼行驶
+    // ============================================================
+    if (spin_intent) {
+        // 连续 spin_enter_confirm_frames_ 帧纯旋转意图 -> 申请切 0x04
+        pending_spin_wz_ = std::clamp(raw_vz,
+            -static_cast<float>(max_spin_angular_vel_),
+             static_cast<float>(max_spin_angular_vel_));
+        // 切换完成前必须停车
+        target_vx_ = 0.0f;
+        target_vz_ = 0.0f;
+        ++spin_enter_counter_;
+        if (spin_enter_counter_ >= spin_enter_confirm_frames_) {
+            spin_enter_counter_ = 0;
+            spin_exit_counter_ = 0;
+            RCLCPP_INFO(this->get_logger(),
+                "[MODE-REQUEST] reason=SPIN_INTENT 0x01 -> 0x04 (wz=%.4f)",
+                pending_spin_wz_);
+            enterState(MotionState::PREPARE_04);
+        }
+        return;
+    }
+
+    spin_enter_counter_ = 0;   // 意图中断, 计数归零
+    pending_spin_wz_ = 0.0f;
+
+    if (tiny_residual) {
+        // 微小残余: 静默归零, 不报警、不切模式
+        target_vx_ = 0.0f;
+        target_vz_ = 0.0f;
+        return;
+    }
+
+    // ---- 下面才是原来的阿克曼处理 ----
+    float requested_vx = raw_vx;
+    float requested_vz = raw_vz;
+
+    // ---- 第一层: 倒车安全门 ----
+    // 允许倒车是"能退出死胡同"的必要条件: 原地自旋无法替代倒车,
+    // 狭窄死胡同可能没有足够空间让 0.73m × 0.50m 车体旋转。
+    if (!allow_reverse && requested_vx < 0.0f) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Reverse command blocked: vx=%.3f", requested_vx);
+        requested_vx = 0.0f;
+    }
+
+    // ---- 第二层: 整车速度限幅 ----
+    // 0x01 模式下四轮解算由 VCU 完成, 上位机只保证整车级安全边界。
+    requested_vx = std::clamp(requested_vx,
+                              -max_reverse_speed,
+                              static_cast<float>(max_forward_speed_));
+
+    // ---- 角速度限幅 ----
+    // 只有阿克曼一种运动方式, 因此 Vz 只有一个上限 max_angular_vel_
+    // (原 V2.08~V2.16 还曾按"自旋段"放宽到 max_spin_angular_vel_, 已删除)。
+    requested_vz = std::clamp(requested_vz,
+                              -static_cast<float>(max_angular_vel_),
+                              static_cast<float>(max_angular_vel_));
+
+    // ============================================================
+    // 阿克曼运动约束 (入口层)
+    // ------------------------------------------------------------
+    // 唯一合法的速度组合:
+    //   |Vx| >= min_moving_speed  →  |Vz| <= |Vx| / R_min  (沿圆弧行驶)
+    //   |Vx| <  min_moving_speed  →  Vx = 0 且 Vz = 0      (停车)
+    // 被禁止的只有 Vx=0 而 Vz≠0 —— 阿克曼几何下前轮必须靠车身前进
+    //   才能产生横摆, 静止时打方向盘车也不会转。
+    //
+    // 注意: 绝不能用"Vx、Vz 同比例缩小"来限曲率 —— 分子分母同时缩小,
+    //       转弯半径完全不变, 那只是整体降速, 不是曲率限制 (旧版错误)。
+    // 本函数只是入口层的第一道整形; 真正不可绕过的强制点在
+    //   sendVelocityCommand() (0x402 唯一出口), 因为加速度斜坡
+    //   approach() 会在这里之后把 cmd_vx_ 衰减经过接近 0 的值。
+    // ============================================================
+    const float abs_vx = std::abs(requested_vx);
+
+    if (abs_vx < static_cast<float>(min_moving_speed_)) {
+        // 低速: 阿克曼几何下不允许"只转不走"。本分支覆盖三类输入:
+        //   a) 极低速圆弧 (Vx 很小, Vz≠0) —— 几何上 R=Vx/Vz 可能合法,
+        //      但整车速度低于底盘下限, 发下去车也走不动
+        //   b) 纯停车指令 (Vx≈0, Vz≈0)   —— 归零, 避免残留极小值反复微动
+        //   c) 纯旋转请求 (Vx≈0, Vz≠0)   —— 阿克曼下非法(前轮必须靠车身
+        //      前进才能产生横摆), 只能归零
+        //
+        // 走到本分支说明: enable_spin_mode 为 false (真自旋请求已在
+        //   cmdVelCallback 开头的 spin_intent 分流处被截走), 或开关为 true
+        //   但 |Vz| 未达 spin_wz_enter —— 两种情况下都不该切 0x04。
+        if (std::abs(requested_vz) > 1e-6f) {
+            const double r = std::abs(requested_vz) > 1e-9f
+                ? static_cast<double>(abs_vx / std::abs(requested_vz)) : 0.0;
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "[ACKERMANN-STOP] 低速命令归零: vx=%.4f wz=%.4f (R=%.3fm; "
+                "速度低于下限 %.4f 无法阿克曼行驶; 如需原地旋转请设 "
+                "enable_spin_mode:=true 走 0x04)",
+                requested_vx, requested_vz, r, min_moving_speed_);
+        }
+        requested_vx = 0.0f;
+        requested_vz = 0.0f;
+    } else {
+        // 正常行驶: 按 R >= R_min 限制 |Vz| (保留正常转弯能力)
+        const float max_curve_wz = static_cast<float>(
+            abs_vx / static_cast<double>(native_min_turning_radius_));
+        const float wz_before = requested_vz;
+        requested_vz = std::clamp(requested_vz, -max_curve_wz, max_curve_wz);
+        if (std::abs(wz_before - requested_vz) > 1e-4f) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "[CURV_LIMIT] wz %.3f -> %.3f (vx=%.3f, R_min=%.2fm)",
+                wz_before, requested_vz, requested_vx, native_min_turning_radius_);
+        }
+    }
+
+    target_vx_ = requested_vx;
+    target_vz_ = requested_vz;
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "[CMD] allow_reverse=%d in(%.3f,%.3f) -> out(%.3f,%.3f)",
+        static_cast<int>(allow_reverse),
+        msg->linear.x, msg->angular.z,
+        target_vx_, target_vz_);
+}
+
+// ============================================================
+// HeartBeat 看门狗
+// ============================================================
+void MandaCanBridge::watchdogCheck() {
+    static bool was_timeout = false;
+    const double elapsed =
+        static_cast<double>(steadyNowMs() - last_cmd_time_ms_.load()) / 1000.0;
+
+    if (elapsed > watchdog_timeout_ &&
+        !is_estopped_.load() &&
+        !hw_estop_active_.load()) {
+        if (!was_timeout) {
+            RCLCPP_WARN(this->get_logger(),
+                "WATCHDOG: No cmd_vel for %.2fs, stopping safely", elapsed);
+
+            std::lock_guard<std::mutex> lock(velocity_mutex_);
+
+            target_vx_ = 0.0f;
+            target_vz_ = 0.0f;
+            cmd_vx_ = 0.0f;
+            cmd_vz_ = 0.0f;
+            pending_spin_wz_ = 0.0f;   // ★ 自旋目标立即清零
+
+            // 按底盘当前实际模式发零速停车帧。
+            // 不能直接切状态 —— 状态机 (updateMotionStateMachine) 负责时序。
+            // 这里只保证: 立刻有一帧零速落到总线上 (1 秒速度有效期不会拖车)。
+            if (motion_state_ == MotionState::ACTIVE_01) {
+                sendZeroForConfirmedMode(state_.current_mode);
+            } else if (motion_state_ == MotionState::ACTIVE_04) {
+                // ★ 安全关键 (2026-09-28): 自旋中命令中断必须立即停转,
+                //   并主动开始"回到 0x01"的完整时序。
+                //   否则小车会持续用最后一次 Vz 旋转 (VCU 速度有 1s 有效期)。
+                sendVelocityCommand(0.0f, 0.0f, 0.0f);
+                RCLCPP_WARN(this->get_logger(),
+                    "[SPIN-SAFETY] 自旋中 cmd_vel 超时 %.2fs -> 停止旋转并切回 0x01",
+                    elapsed);
+                enterState(MotionState::PREPARE_RETURN_01);
+            }
+
+            was_timeout = true;
+        }
+    } else if (elapsed <= watchdog_timeout_) {
+        was_timeout = false;
+    }
+}
+
+// ============================================================
+// 循环下发线程: 整车阿克曼速度下发 (0x402)
+// ------------------------------------------------------------
+// 每轮工作只有三件事:
+//   1) 整车加速度斜坡 (max_linear_accel_ / max_angular_accel_)
+//   2) 推进运动状态机 (处理 0x401 切换与静默时序)
+//   3) 由状态机在 ACTIVE_01 下发 0x402(Vx, 0, Vz)
+// 不解算 0x403/0x404 —— 四轮转角与轮速由 VCU 按前后轮阿克曼几何
+// 自行分配。
+// ============================================================
+void MandaCanBridge::velocityLoop() {
+    while (rclcpp::ok() && velocity_running_) {
+        // ============================================================
+        // 急停处理 (按底盘当前实际模式选正确的帧型)
+        // ------------------------------------------------------------
+        // 置零目标速度并立即发一帧停车; 不可无条件发 0x402:
+        //   若底盘此刻是 0x08 逐轮控制, 0x402 无效;
+        //   若处于 250ms 静默窗口内, 发任何帧都会破坏 0x401 衔接。
+        // 这两点由 sendZeroForConfirmedMode() 内部统一处理。
+        // ============================================================
+        if (hw_estop_active_ || is_estopped_) {
+            {
+                std::lock_guard<std::mutex> estop_lock(velocity_mutex_);
+                target_vx_ = 0.0f;
+                target_vz_ = 0.0f;
+                cmd_vx_ = 0.0f;
+                cmd_vz_ = 0.0f;
+                sendZeroForConfirmedMode(state_.current_mode);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(loop_ms_));
+            continue;
+        }
+
+        // ============================================================
+        // 单控制链
+        // ------------------------------------------------------------
+        // 整车速度经加速度斜坡后, 一律由 0x402 下发, 模式恒为 0x01:
+        //   VCU 解算四轮转角与轮速, 走圆弧完成所有转向。
+        //   若斜坡把 cmd_vx_ 衰减到 min_moving_speed 以下而 cmd_vz_ 仍非零,
+        //   sendVelocityCommand() 会把该帧整体归零 (低速停驶保护, 非原地旋转保护)。
+        // 无 0x08 路径、不逐轮计算 0x403/0x404。
+        // 锁内完成"斜坡 + 状态机推进 + 发送", 锁外休眠 ——
+        // 不可持锁休眠, 否则会阻塞 cmd_vel 更新 / 0x104 反馈 / 看门狗。
+        // ============================================================
+        {
+            std::lock_guard<std::mutex> lock(velocity_mutex_);
+
+            const double dt = static_cast<double>(loop_ms_) / 1000.0;
+
+            // ---- 整车加速度斜坡 ----
+            // VCU 侧也有自己的加减速限制, 但上位机先做一层可以让下发序列
+            // 更平滑, 避免 Nav2 偶发的速度跳变直接砸到执行机构上。
+            //
+            // 减速不做限制 (安全优先), 目标变小/归零时立即跟随 —— 但"反号"
+            // 不算减速: 例如目标从 +0.15 变成 -0.08, |目标| 是变小了, 可实际
+            // 要求是"先停再反向"。若直接跳变会让 VCU 收到一帧速度方向突变,
+            // 执行机构可能出现冲击/顿挫。因此反号时仍走斜坡, 由
+            // approach() 自然经过 0 再反向。
+            const bool same_direction =
+                (target_vx_ == 0.0f || cmd_vx_ == 0.0f ||
+                 (target_vx_ > 0.0f) == (cmd_vx_ > 0.0f)) &&
+                (target_vz_ == 0.0f || cmd_vz_ == 0.0f ||
+                 (target_vz_ > 0.0f) == (cmd_vz_ > 0.0f));
+
+            const bool shrinking =
+                (std::abs(target_vx_) < std::abs(cmd_vx_)) ||
+                (std::abs(target_vz_) < std::abs(cmd_vz_));
+
+            if (shrinking && same_direction) {
+                // 同向减速: 立即跟随, 保证及时停车
+                cmd_vx_ = target_vx_;
+                cmd_vz_ = target_vz_;
+            } else {
+                cmd_vx_ = approach(cmd_vx_, target_vx_, max_linear_accel_ * dt);
+                cmd_vz_ = approach(cmd_vz_, target_vz_, max_angular_accel_ * dt);
+            }
+
+            // ---- 运动状态机推进 (内部负责模式切换与 0x402 下发) ----
+            updateMotionStateMachine();
+
+            // ---- 诊断日志 (5s 节流) ----
+            if (motion_state_ == MotionState::ACTIVE_01) {
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[DRIVE] ACK01 | cmd(%.3f, %.3f) actual_mode=0x%02X fb(%.3f,%.3f) R=%.2fm",
+                    cmd_vx_, cmd_vz_, state_.current_mode,
+                    state_.motion_vx, state_.motion_vz,
+                    (std::abs(cmd_vz_) < 1e-6
+                         ? std::numeric_limits<double>::infinity()
+                         : std::abs(static_cast<double>(cmd_vx_) / cmd_vz_)));
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(loop_ms_));
+    }
+}
+
+// ============================================================
+// CAN 接收线程 & 反馈解析
+// ============================================================
+void MandaCanBridge::canReceiveLoop() {
+    struct can_frame frame;
+    last_time_ = this->now();
+    last_joint_time_ = this->now();
+
+    while (rclcpp::ok() && receive_running_) {
+        int nbytes = read(can_socket_, &frame, sizeof(struct can_frame));
+        if (nbytes <= 0) {
+            if (!receive_running_ || !rclcpp::ok()) {
+                break;
+            }
+            if (errno == EBADF || errno == EINVAL) {
+                break;
+            }
+            continue;
+        }
+
+        switch (frame.can_id) {
+            // 0x100: 系统状态 + 硬件急停检测
+            case 0x100:
+                if (frame.can_dlc >= 8) {
+                    state_.battery_alarm   = frame.data[0];
+                    state_.control_mode    = frame.data[1];
+                    state_.peripheral_bits = frame.data[2];
+                    state_.battery_soc     = frame.data[3];
+
+                    // ============================================================
+                    // manda V2.08 控制权管理 (协议 V1.24)
+                    // 0x100 Byte[1]: 0x00=待机 / 0x01=遥控器控制 / 0x02=指令控制(CAN)
+                    // ------------------------------------------------------------
+                    // 注意: 0x100 Byte[1] 与 0x104 Byte[6] 都可能出现 0x02,
+                    //       但含义完全不同 (控制权 vs 斜移运动模式), 不可混用。
+                    //
+                    // 锁存语义 (只告警 + 停止发送, 不抢回控制权):
+                    //   检测到 Byte[1]!=0x02 → REMOTE_OVERRIDE, 完全静默;
+                    //   交还 (回 0x02) 后不恢复旧速度, 而是回 PREPARE_01 走完整时序。
+                    // 不做"周期重发 401 抢回": 人工接管是安全行为, 软件不应与操作者
+                    //   争权; 且会破坏 250ms 静默窗口; 0x401 属运动模式切换而非控制权,
+                    //   未必有效。
+                    // ============================================================
+                    const uint8_t ctrl = frame.data[1];
+
+                    // 首次收到 0x100 → 记录控制权并放行发送门控
+                    const bool first_time = !control_mode_known_.load();
+                    control_mode_.store(ctrl);
+                    control_mode_known_.store(true);
+
+                    if (first_time) {
+                        RCLCPP_INFO(this->get_logger(),
+                            "[SAFETY] 已确认控制权 (0x100 Byte[1]=0x%02X): %s",
+                            ctrl, ctrl == 0x02 ? "指令控制(CAN)" :
+                                  ctrl == 0x01 ? "遥控器控制(人工接管)" : "待机");
+                    }
+
+                    if (ctrl != last_control_mode_) {
+                        last_control_mode_ = ctrl;
+                        if (ctrl != 0x02) {
+                            // ---- 人工接管 / 待机: 停止所有输出 ----
+                            // 此处不再尝试"补发停车帧": control_mode_ 已在上方更新为
+                            // 非 0x02, allowMotionTx() 会立即拒绝任何运动帧 (包括零速),
+                            // 补发必然失败。
+                            //
+                            // 语义: 人工接管后车辆由遥控器负责, 软件只负责"把本地状态
+                            // 清干净并彻底闭嘴", 不再争抢。若接管瞬间恰在自旋, 底盘
+                            // 固件自身有速度 1 秒有效期, 遥控器接管后即可即时覆盖。
+                            remote_override_.store(true);
+                            {
+                                std::lock_guard<std::mutex> ov_lock(velocity_mutex_);
+                                target_vx_ = 0.0f;
+                                target_vz_ = 0.0f;
+                                cmd_vx_ = 0.0f;
+                                cmd_vz_ = 0.0f;
+                                enterState(MotionState::REMOTE_OVERRIDE);
+                            }
+                            // 作废旧 cmd_vel 心跳, 避免交还后立即触发 watchdog 误判
+                            last_cmd_time_ms_.store(0);
+                            RCLCPP_WARN(this->get_logger(),
+                                "[SAFETY] 人工接管 (0x100 Byte[1]=0x%02X) -> REMOTE_OVERRIDE: "
+                                "已清空本地目标速度并停止所有运动帧输出, 车辆交由遥控器控制 "
+                                "(不抢回控制权, 不补发停车帧)", ctrl);
+                        } else {
+                            // ---- 控制权交还给 CAN ----
+                            if (remote_override_.load()) {
+                                remote_override_.store(false);
+                                {
+                                    std::lock_guard<std::mutex> ov_lock(velocity_mutex_);
+                                    // 丢弃旧 cmd_vel, 重新走完整时序: 静默 250ms → 0x401#01
+                                    target_vx_ = 0.0f;
+                                    target_vz_ = 0.0f;
+                                    cmd_vx_ = 0.0f;
+                                    cmd_vz_ = 0.0f;
+                                    resync_retry_count_ = 0;
+                                    mode_mismatch_streak_ = 0;   // 复位连续异常计数
+                                    enterState(MotionState::PREPARE_01);
+                                    // 静默基准重置, 使 PREPARE_01 先等满静默期再发 401
+                                    mode_cmd_sent_ts_ = std::chrono::steady_clock::now();
+                                }
+                                last_cmd_time_ms_.store(steadyNowMs());
+                                RCLCPP_WARN(this->get_logger(),
+                                    "[SAFETY] 控制权已交还 CAN (0x100 Byte[1]=0x02) -> "
+                                    "重新初始化到 0x01 完整时序, 只接受此后新的 cmd_vel");
+                            }
+                        }
+                    }
+
+                    hw_estop_active_ = (state_.peripheral_bits & 0x01) != 0;
+                    if (hw_estop_active_) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "HARDWARE ESTOP ACTIVE (0x100 data[2]=0x%02x)! Motors locked.", state_.peripheral_bits);
+                    }
+
+                    int16_t voltage_10mv = (static_cast<int16_t>(frame.data[4]) << 8) | frame.data[5];
+                    int16_t current_10ma = (static_cast<int16_t>(frame.data[6]) << 8) | frame.data[7];
+                    state_.battery_voltage_10mv = voltage_10mv;
+                    state_.battery_current_10ma = current_10ma;
+
+                    auto battery = sensor_msgs::msg::BatteryState();
+                    battery.header.stamp = this->now();
+                    battery.voltage = voltage_10mv * 0.01f;
+                    battery.current = current_10ma * 0.01f;
+                    battery.percentage = state_.battery_soc / 100.0f;
+                    battery.power_supply_status = (state_.battery_alarm & 0x01)
+                        ? sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_DISCHARGING
+                        : sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING;
+                    battery.power_supply_health = (state_.battery_alarm & 0x02)
+                        ? sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_DEAD
+                        : sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_GOOD;
+                    battery.present = true;
+                    battery_pub_->publish(battery);
+
+                    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "Battery: %.1fV %.1fA SOC=%d%% mode=%d estop=%d",
+                        voltage_10mv * 0.01, current_10ma * 0.01,
+                        state_.battery_soc, state_.control_mode,
+                        // atomic_bool 不能直接传给 printf 变参 (无隐式转换, UB), 需显式取 int
+                        static_cast<int>(hw_estop_active_.load()));
+                }
+                break;
+
+            // 0x101: 四轮速度反馈 → joint_states
+            case 0x101:
+                if (frame.can_dlc >= 8) {
+                    for (int i = 0; i < 4; i++)
+                        state_.wheel_speed[i] = canBytesToSpeed(frame.data[i*2], frame.data[i*2+1]);
+                    publishJointStates();
+                }
+                break;
+
+            // 0x102: 四轮转向角度反馈 → joint_states
+            case 0x102:
+                if (frame.can_dlc >= 8) {
+                    for (int i = 0; i < 4; i++)
+                        state_.steer_angle[i] = canBytesToAngle(frame.data[i*2], frame.data[i*2+1]);
+                    publishJointStates();
+                }
+                break;
+
+            // 0x103: 故障状态 → 安全急停
+            case 0x103:
+                if (frame.can_dlc >= 5) {
+                    state_.system_fault         = frame.data[0];
+                    state_.drv_fault_walk_bits  = frame.data[1];
+                    state_.drv_fault_steer_bits = frame.data[2];
+                    state_.drv_comm_lost_walk   = frame.data[3];
+                    state_.drv_comm_lost_steer  = frame.data[4];
+
+                    bool has_fault = (state_.system_fault != 0 ||
+                                      state_.drv_fault_walk_bits != 0 ||
+                                      state_.drv_fault_steer_bits != 0 ||
+                                      state_.drv_comm_lost_walk != 0 ||
+                                      state_.drv_comm_lost_steer != 0);
+
+                    if (has_fault && !is_estopped_) {
+                        is_estopped_ = true;
+                        RCLCPP_ERROR(this->get_logger(),
+                            "FAULT! sys=0x%02x walk=0x%02x steer=0x%02x lost_w=%d lost_s=%d",
+                            state_.system_fault, state_.drv_fault_walk_bits,
+                            state_.drv_fault_steer_bits, state_.drv_comm_lost_walk,
+                            state_.drv_comm_lost_steer);
+                        // manda V2.08: 此处不再直接发 403/404。
+                        // 若当前处于 0x04 自旋或 250ms 静默窗口内, 发 403/404 会用错帧型
+                        // 并破坏协议静默, 反而导致模式切换失败。
+                        // 只置急停标志 + 清空目标速度, 由 velocityLoop() 按当前模式
+                        // 选择正确的停车帧 (0x04/0x01 用 402 / 0x08 用 403+404 / 静默窗口内不发)。
+                        {
+                            std::lock_guard<std::mutex> estop_lock(velocity_mutex_);
+                            target_vx_ = 0.0f;
+                            target_vz_ = 0.0f;
+                            cmd_vx_ = 0.0f;
+                            cmd_vz_ = 0.0f;
+                        }
+                    } else if (!has_fault && is_estopped_) {
+                        is_estopped_ = false;
+                        RCLCPP_INFO(this->get_logger(), "FAULT CLEARED");
+                    }
+                }
+                break;
+
+            // 0x104: 运动反馈 → 里程计推算
+            case 0x104: {
+                // 先取出底盘上报的运动模式, 因为 vz 的标度系数是按模式选择的
+                const uint8_t fb_mode = frame.data[6];
+
+                float vx = canBytesToSpeed(frame.data[0], frame.data[1]);
+                float vy = canBytesToSpeed(frame.data[2], frame.data[3]);
+                // manda V2.08: vz 标度按底盘实际运动模式分别标定。
+                // 旧的单一 vz_scale=1.84 来自 0x08 逐轮控制, 换成 0x01 官方
+                // 运动学后不能沿用 —— 0x01/0x04 初始取 1.0, 待重新标定。
+                float vz = canBytesToSpeed(frame.data[4], frame.data[5]) *
+                           static_cast<float>(vzScaleForMode(fb_mode));
+                state_.motion_vx = vx;
+                state_.motion_vy = vy;
+                state_.motion_vz = vz;
+                state_.current_mode = fb_mode;
+                state_.mode_switch_state = frame.data[7];
+
+                // 将 0x104 的模式/切换完成标志喂给运动状态机,
+                // 用于确认 0x01 ↔ 0x04 切换是否真正完成, 并检测模式异常
+                {
+                    std::lock_guard<std::mutex> fb_lock(velocity_mutex_);
+                    onModeFeedback(fb_mode, frame.data[7]);
+                }
+
+                rclcpp::Time current_time = this->now();
+                double dt = (current_time - last_time_).seconds();
+                if (dt <= 0.0) dt = 0.01;
+
+                double delta_x = (vx * std::cos(th_) - vy * std::sin(th_)) * dt;
+                double delta_y = (vx * std::sin(th_) + vy * std::cos(th_)) * dt;
+                double delta_th = vz * dt;
+
+                x_ += delta_x;
+                y_ += delta_y;
+                th_ += delta_th;
+                // manda 修复: 规范化 Yaw 到 [-π, π], 防止长时间运行精度下降
+                th_ = std::remainder(th_, 2.0 * M_PI);
+                last_time_ = current_time;
+
+                auto odom = nav_msgs::msg::Odometry();
+                odom.header.stamp = current_time;
+                odom.header.frame_id = odom_frame_id_;
+                odom.child_frame_id = base_frame_id_;
+                odom.pose.pose.position.x = x_;
+                odom.pose.pose.position.y = y_;
+                odom.pose.pose.position.z = 0.0;
+                tf2::Quaternion q;
+                q.setRPY(0, 0, th_);
+                odom.pose.pose.orientation.x = q.x();
+                odom.pose.pose.orientation.y = q.y();
+                odom.pose.pose.orientation.z = q.z();
+                odom.pose.pose.orientation.w = q.w();
+                odom.twist.twist.linear.x = vx;
+                odom.twist.twist.linear.y = vy;
+                odom.twist.twist.angular.z = vz;
+
+                // ---- manda 修复: 填充 twist 协方差 ----
+                // 底盘 0x104 反馈的 vx/vy/vz 有噪声/量化误差, 若协方差全 0,
+                // robot_localization EKF 会把这些测量当"绝对准确"融合,
+                // 导致对噪声极度敏感 → 航向/位置震荡 → 雷达点云乱窜。
+                // 设置合理的协方差 (单位: m^2/s^2 与 rad^2/s^2), 让 EKF 平衡信任度。
+                // 6x6 对角线: [vx, vy, vz, vroll, vpitch, vyaw]
+                //   vx: 轮速编码器, 较可靠 → 1e-2
+                //   vy: 阿克曼模式无横移, 噪声大 → 1e-1 (且已在 EKF 中关闭融合)
+                //   vz (vyaw): 转向反馈, 有一定噪声 → 5e-3
+                const double odom_twist_cov[36] = {
+                    1.0e-2, 0, 0, 0, 0, 0,
+                    0, 1.0e-1, 0, 0, 0, 0,
+                    0, 0, 1.0e-6, 0, 0, 0,
+                    0, 0, 0, 1.0e-6, 0, 0,
+                    0, 0, 0, 0, 1.0e-6, 0,
+                    0, 0, 0, 0, 0, 5.0e-3
+                };
+                std::copy(std::begin(odom_twist_cov), std::end(odom_twist_cov),
+                          odom.twist.covariance.begin());
+
+                odom_pub_->publish(odom);
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
+}
+
+// ============================================================
+// 发布 joint_states (0x101 轮速 + 0x102 转角 → 累计位置)
+// ============================================================
+void MandaCanBridge::publishJointStates() {
+    auto js = sensor_msgs::msg::JointState();
+    js.header.stamp = this->now();
+
+    rclcpp::Time now = this->now();
+    double dt = (now - last_joint_time_).seconds();
+    if (dt <= 0.0) dt = 0.02;
+    last_joint_time_ = now;
+
+    // 关节名必须与 manda.urdf 中的关节名完全一致, 否则 robot_state_publisher
+    // 无法匹配, rviz 中车轮/转向臂不显示, 模型会"变白块"。
+    js.name = {
+        "front_left_wheel_rotor_joint", "rear_left_wheel_rotor_joint",
+        "front_right_wheel_rotor_joint", "rear_right_wheel_rotor_joint",
+        "front_left_wheel_steer_joint", "rear_left_wheel_steer_joint",
+        "front_right_wheel_steer_joint", "rear_right_wheel_steer_joint"
+    };
+    js.position.resize(8);
+    js.velocity.resize(8);
+
+    for (int i = 0; i < 4; i++) {
+        const double wheel_angular_speed = state_.wheel_speed[i] / wheel_radius_;
+        wheel_pos_[i] += wheel_angular_speed * dt;
+        js.position[i] = wheel_pos_[i];
+        js.velocity[i] = wheel_angular_speed;
+        steer_pos_[i] = state_.steer_angle[i] * M_PI / 180.0;
+        js.position[4 + i] = steer_pos_[i];
+        js.velocity[4 + i] = 0.0;
+    }
+    joint_state_pub_->publish(js);
+}

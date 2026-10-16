@@ -1,0 +1,693 @@
+amcl:
+  ros__parameters:
+    use_sim_time: False
+    alpha1: 0.4   #里程计的旋转估计中来自旋转的预期过程噪声
+    alpha2: 0.2   #里程计的旋转估计中来自平移的预期过程噪声
+    alpha3: 0.2  #里程计的翻译估计中来自translation的预期过程噪声
+    alpha4: 0.4  #里程计的平移估计中因旋转而产生的预期过程噪声
+    alpha5: 0.2  #仅适用于 Omni 型号：translation噪音
+    base_frame_id: "base_footprint" #机器人底座框架 
+    introspection_mode: "disabled" #启用调试模式，这将发布额外的调试信息 
+    beam_skip_distance: 0.5         #忽略似然场模型中大多数粒子不同意的光束。考虑跳过的最大距离（米）
+    beam_skip_error_threshold: 0.9  #由于收敛性不好，未匹配地图后强制进行完全更新的光束百分比
+    beam_skip_threshold: 0.3        #需要跳过的光束的百分比。
+    do_beamskip: false              #是否在似然场模型中进行波束跳跃
+    global_frame_id: "map"          #定位系统发布的坐标框架的名称
+    lambda_short: 0.1               #模型 z_short 部分的指数衰减参数
+    laser_likelihood_max_dist: 2.0  #在地图上进行障碍物膨胀的最大距离，用于似然场模型
+    laser_max_range: 100.0          #要考虑的最大扫描范围，-1.0 将导致使用激光报告的最大范围
+    laser_min_range: -1.0           #要考虑的最小扫描范围，-1.0 将导致使用激光报告的最小范围
+    laser_model_type: "likelihood_field" #使用哪种模型，
+    #beam、likelihood_field 或 unlikely_field_prob。与 unlikely_field 相同，但如果启用，则包含 beamskip 功能
+    max_beams: 60                   #更新过滤器时每次扫描要使用多少个均匀分布的光束。
+    max_particles: 2000             #允许的最大粒子数
+    min_particles: 500              #允许的最小粒子数
+    odom_frame_id: "odom_combined"  #使用哪个框架进行里程计
+    pf_err: 0.05                    #粒子过滤器群体误差
+    pf_z: 0.99                      #粒子过滤器群体密度
+    recovery_alpha_fast: 0.0        #快速平均权重过滤器的指数衰减率，用于决定何时通过添加随机姿势进行恢复。
+    recovery_alpha_slow: 0.0        #慢速平均权重过滤器的指数衰减率，用于决定何时通过添加随机姿势进行恢复。
+    resample_interval: 1            #重采样之前所需的过滤器更新次数
+    robot_model_type: "nav2_amcl::DifferentialMotionModel" #插件类的完全限定类型。阿克曼也适用差分模型进行定位更新
+    save_pose_rate: 0.5             #将最后估计的姿势和协方差存储到参数服务器的最大速率（Hz）
+    sigma_hit: 0.2                 #模型的 z_hit 部分中使用的高斯模型的标准差
+    tf_broadcast: true              #将其设置为 false 以防止 amcl 发布全局框架和里程计框架之间的变换
+    transform_tolerance: 1.0        #发布转换的容差
+    update_min_a: 0.2              #执行过滤器更新之前需要进行旋转运动。
+    update_min_d: 0.25             #执行过滤器更新之前需要进行平移运动
+    z_hit: 0.5                      #模型的 z_hit 部分的混合权重，所有使用的 z 权重之和必须为 1。
+    z_max: 0.05                    #模型的 z_max 部分的混合权重，所有使用的 z 权重之和必须为 1。
+    z_rand: 0.5                   #模型的 z_rand 部分的混合权重，所有使用的 z 权重之和必须为 1。
+    z_short: 0.05                   #模型中 z_short 部分的混合权重，所有使用的 z 权重之和必须为 1。
+    scan_topic: scan                #要订阅的激光雷达
+    map_topic: map
+    first_map_only: False
+
+    # Initial Pose
+    set_initial_pose: True #AMCL 从 initial_pose* 参数设置初始姿势，而不是等待 initial_pose 消息
+    initial_pose.x: 0.0
+    initial_pose.y: 0.0
+    initial_pose.z: 0.0
+    initial_pose.yaw: 0.0
+
+amcl_map_client:
+  ros__parameters:
+    use_sim_time: False
+
+amcl_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: False
+    transform_tolerance: 0.1 #变换容差
+    goal_reached_tol: 0.25 #接受姿势作为目标的容忍度(m)
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: /odom_combined
+    # manda V2.08: 行为树改为单规划器 / 单控制器版本 (navigate_single_mode.xml)。
+    # 双模式 (PlannerSelector / ControllerSelector) 已删除 —— 之前两套
+    # ForwardPlanner(DUBIN) + ManeuverPlanner(REEDS_SHEPP) 实际没有自动切换,
+    # 既增大了配置面也掩盖了"DUBIN 不能倒车退出死胡同"的真问题。
+    # 行为树放在本工作区自己的包里 (wheeltec_robot_nav2/behavior_trees/),
+    # 由该包 CMakeLists.txt 的 install(DIRECTORY ... behavior_trees) 安装。
+    # 配合 --symlink-install, 改 XML 后无需重新 colcon build 即生效。
+    default_nav_to_pose_bt_xml: "/nvme/sunrise/manda_cpy/install/wheeltec_nav2/share/wheeltec_nav2/behavior_trees/navigate_forward_backup.xml"
+    # manda V2.09: 不再把单点 BT 复用给 through_poses!
+    # ------------------------------------------------------------
+    # 两者黑板变量与动作类型不同, 不能混用:
+    #   单点 NavigateToPose   : <ComputePathToPose       goal="{goal}"   .../>
+    #   多点 NavigateThrough  : <ComputePathThroughPoses goals="{goals}" .../>
+    # 之前为了绕过 bt_navigator 激活失败, 曾把 through_poses 也指向单点 BT。
+    # 那样虽然能激活, 但真正调用 /navigate_through_poses 时会执行错误。
+    # 现在不设置该参数, 保持 Nav2 官方默认 - 能正常激活(因为 behavior_server
+    # 已提供 /spin), 且多点导航语义正确。
+    # 若以后确实要用 /navigate_through_poses 且不想执行自旋恢复,
+    # 再单独建一个 navigate_through_poses_no_spin.xml (用 {goals} +
+    # ComputePathThroughPoses, 把 <Spin> 换成 <Wait>/<BackUp>)。
+    #
+    # 本工作区实测: nav2_waypoint_cycle/waypoint_cycle.py 只订阅
+    # "navigate_to_pose/_action/status", 即只用单点接口, 多点暂不会用到。
+    bt_loop_duration: 10        #BT 执行每次迭代的持续时间（以毫秒为单位）
+    default_server_timeout: 20  #BT 操作节点等待操作服务器确认时的默认超时值（以毫秒为单位）
+
+bt_navigator_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+controller_server:
+  ros__parameters:
+    use_sim_time: False
+    controller_frequency: 20.0                #运行控制器的频率
+    odom_topic: /odom_combined
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["goal_checker"]
+    # ============================================================
+    # manda V2.08: 三层速度/几何常量必须一致 (改一处必须同时改另外两处)
+    # ------------------------------------------------------------
+    #             MPPI (本文件)   |  底盘桥 (manda_param.yaml)  |  Smac (本文件)
+    # 前进上限    vx_max           |  max_forward_speed          |  -
+    # 倒车上限    vx_min           |  max_reverse_speed          |  -
+    # 旋转上限    wz_max           |  max_angular_vel             |  -
+    # 最小转弯半径 AckermannConstraints.min_turning_r | native_min_turning_radius | minimum_turning_radius
+    #
+    # 当前取值使 R_min = vx_max / wz_max = 0.15 / 0.30 = 0.50m, 与 min_turning_r 严格相等。
+    # 为何不让 MPPI 给得更大再由底盘删掉: 底盘会把超限值静默限幅并打 CURV_LIMIT 日志,
+    # MPPI 却以为自己拿到了 0.30, 控制目标与实际下发不一致 -> 轨迹跟踪变差。
+    # 宁可上游就按真实上限约束, 避免静默削顶。
+    # (若要改半径, 必须四处同改: 本文件 vx_max/wz_max + min_turning_r +
+    #  minimum_turning_radius + 底盘 native_min_turning_radius,
+    #  保持 R_min = vx_max / wz_max 与两者相等)
+    # ============================================================
+    # manda V2.08: 只保留一个控制器。
+    # 原先 FollowPathForward / FollowPathManeuver 两套其实是同一份 RotationShim+MPPI
+    # 参数, 靠 ControllerSelector 切换, 但实际从未真正切换过 —— 徒增配置面。
+    # 现在脱困靠 REEDS_SHEPP 规划出的倒车段 + 恢复行为 (BackUp/Spin) 完成。
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.10           #所需运动半径(放宽:大弯起步低速,避免误判卡住)
+      # manda V2.12: 15.0 -> 30.0 (回退我上一轮的过度下调)。
+      # ------------------------------------------------------------
+      # 为什么必须回到 30.0 —— 这是"到点后反复后退"的**第一触发点**:
+      # controller_server.cpp 主循环里顺序是
+      #     computeAndPublishVelocity();       // 内部会 throw
+      #     if (isGoalReached()) { break; }    // 永远轮不到
+      # 而 computeAndPublishVelocity() 里:
+      #     if (!progress_checker_->check(pose)) throw "Failed to make progress"
+      # SimpleProgressChecker: 若在 time_allowance 内位移 <= 0.10m 则返回 false。
+      #
+      # 车到点附近做姿态微调时, 位移本来就 < 0.10m:
+      #   阿克曼 R=0.50 转 0.18rad 只需行进 0.09m —— 天生小于进度阈值!
+      # 于是 progress 先抛异常 -> 目标判定根本没机会执行 -> 目标永不完成
+      # -> BT 恢复动作 -> ClearCostmap + BackUp(0.30m) -> 车后退 -> 点云漂。
+      #
+      # 30.0 是安全值: 给"终点低速磨姿态"留足时间, 避免误判;
+      # 真正卡死在窄通道时(位移长期为0)仍会在 30s 后触发脱困。
+      movement_time_allowance: 30.0            #移动时间容差 (2026-09-17: 15.0 -> 30.0, 修复终点误触发)
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.20                  #xy 目标容差
+      # ============================================================
+      # manda V2.12: yaw 容差 0.18 -> 0.35 rad (≈20.1°)
+      # ------------------------------------------------------------
+      # 真正的"绑定约束"是 yaw, 不是 xy:
+      #   xy_goal_tolerance = 0.20 相对宽松, 但 SimpleGoalChecker 要求
+      #   XY **且** yaw 同时满足才判定到达。
+      #   而本车: rotate_to_goal_heading=false (不做终点原地旋转) + vx_min=0
+      #   (MPPI 不许倒车) + R_min=0.50 (阿克曼几何锁死)
+      #   => 要改变 yaw 只能"走弧线", 且必须前进方向允许。
+      #   靠墙/投喂位时 MPPI 所有前进弧线都可能被判 collision -> 只能微动,
+      #   于是卡在 0.18 迟迟不收敛 -> 叠加上面的 progress 检查 -> 误触发恢复。
+      #
+      # 0.18 rad 对阿克曼本车过于苛刻(需精确对准)。放宽到 0.35 后:
+      #   进点过程中 GoalAngleCritic(weight 4.0, 1.2m 起) 已把朝向大致拉正,
+      #   最后 20° 的残差不再阻塞"到达"判定 -> 到点即停, 不再原地磨。
+      # 若投喂点位对姿态确实敏感, 可折中取 0.25(≈14.3°)。
+      # ⚠ 注意: 即使放宽 yaw, 若"0 poses"/TF 落后问题未解决, 仍可能无故倒退 ——
+      #   那是独立问题, 不应继续靠放宽容差来掩盖。
+      # ============================================================
+      yaw_goal_tolerance: 0.35                 #yaw目标容差 (2026-09-17: 0.18 -> 0.35, ≈20.1°)
+      stateful: True
+
+    FollowPath:
+      # 用 RotationShim 包住 MPPI, 实现"终点原地对向":
+      #   正常行驶    : 全部交给内部 MPPI (primary_controller) 处理
+      #   进入 XY 容差: Shim 接管, 输出 vx=0 / wz≠0 的纯角速度
+      #                 → 底盘桥下发 0x402(Vx=0, Vz≠0) → VCU 自动进 0x04 自旋
+      # 注意: 内部 MPPI 仍使用 FollowPath 这个参数命名空间,
+      #       所以下面原有 MPPI 参数保持在同级, 不要另建 primary_controller: 子段。
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "nav2_mppi_controller::MPPIController"
+
+      angular_dist_threshold: 3.20    # rad: 起转阈值 (0.785 -> 3.20, 实质禁用起步旋转)
+      # ============================================================
+      # manda V2.15: 彻底删除原地旋转 (0.785 -> 3.20 = 183°)
+      # ------------------------------------------------------------
+      # 为何删: 实测发现 VCU 固件**未响应 0x04 自旋**——
+      #   2026-09-17 现场抓包: 底盘桥已正确下发了 0x402(Vx=0, Vz≠0)
+      #   纯旋转指令, 但 0x104 的 mode 字段**始终为 0x01**, 从未出现 0x04。
+      #   而 0x01 前后轮阿克曼在 Vx=0 时物理上无法旋转 → 车原地不动,
+      #   表现为"准备转弯又停止"、"有路径但车不动"。
+      # 也就是说: 在固件响应 0x04 之前, 任何"靠纯旋转对正"的设计都不可用,
+      #   反而会把 Nav2 卡在 RotationShim 里 (它以为在转, 实际没转)。
+      # 3.20 ≈ 183° > π → 起步时永远不会接管旋转, 直接交给 MPPI 跟路。
+      # 需重新启用时: 本项改回 0.785, 并确认 use_vcu_auto_spin=true
+      #   且固件确实会回 0x104 mode=0x04。
+      # ============================================================
+      angular_disengage_threshold: 3.20  # rad: 退出旋转阈值 (与起转同值, 保持一致)
+      forward_sampling_distance: 0.50   # m: 前视采样距离
+      rotate_to_heading_angular_vel: 0.20  # rad/s: 旋转角速度(仅当阈值被调小时才生效)
+      # 与底盘 max_angular_accel (0.30) 严格一致。
+      # 若这里给得更大 (例如 0.40), 底盘会静默把角加速度斜坡限制到 0.30,
+      # 结果是 Nav2 以为按 0.40 加减速, 实际只做到 0.30 -> 终点旋转的
+      # 减速/停止时机与 RotationShim 闭环预期不符 -> 过冲或“转不到位”。
+      max_angular_accel: 0.30           # rad/s^2: 角加速度上限(= 底盘 max_angular_accel)
+      simulate_ahead_time: 1.0          # s: 旋转前碰撞预测时间
+      # ============================================================
+      # manda V2.15: 删除"到点后原地对向" (true -> false)
+      # ------------------------------------------------------------
+      # 实测证据 (2026-09-17 现场抓包):
+      #   · 底盘桥正确下发了 0x402(Vx=0, Vz≠0) 纯旋转指令
+      #   · 但 0x104 mode **始终 0x01**, VCU 从未进入 0x04
+      #   · Vx=0 且 mode=0x01 时物理上转不了 -> 车原地不动
+      #   · 日志表现为 "Failed to make progress" x N + 反复 Running backup
+      # 结论: 在固件确认支持自动 0x04 之前, 该项必须为 false,
+      #   否则 RotationShim 会卡在它自己以为的"旋转中"而车实际不动。
+      #
+      # 对正策略回归到 V2.09 的"进点过程中提前对正":
+      #   靠 GoalAngleCritic(weight 4.0, threshold 1.2) 在 1.2m 外
+      #   就用阿克曼曲线把朝向逐步拉正, 不依赖任何原地旋转。
+      # 投喂点位的目标箭头仍需沿通道方向, 与预计进场方向一致。
+      # ============================================================
+      rotate_to_goal_heading: false     # 删除终点接管 (固件不支持 0x04)
+      closed_loop: true                 # 闭环: 考虑加速度限制平滑加减速
+
+      time_steps: 80    #候选轨迹中的时间步长（点）数 (2026-09-17: 56 -> 80, 拉长预测时域)
+      model_dt: 0.05    #每个时间步长的时间步长的长度dt（以秒为单位）是预测范围
+      batch_size: 1500  #在给定迭代中从当前最佳控制序列中随机采样的候选轨迹的数量
+                        # (2026-09-17: 2000 -> 1500, 抵消 time_steps 增加的计算量,
+                        #  56×2000=112000 -> 80×1500=120000, 基本持平, 守住20Hz控制周期)
+      vx_std: 0.06      #Vx 的抽样标准差 (2026-09-17: 0.15 -> 0.06)
+                        # 原 0.15 等于整个前进速度上限 —— 在 1.3m 窄通道里会大量
+                        # 采样到忽快忽慢的轨迹, 车体左右摇摆。降到上限的 60%。
+      vy_std: 0.0       #Vy 的抽样标准差 (阿克曼无横向速度)
+      wz_std: 0.08      #Wz（角速度）的抽样标准差 (2026-09-17: 0.20 -> 0.08)
+                        # 原 0.20 达到角速度上限的 2/3, 窄通道里采样出大量左右急转
+                        # 轨迹, MPPI 在它们之间反复选 -> 顿挫。
+                        # 注意: 采样范围变小不等于转不了弯 —— 转弯靠代价项把均值
+                        #       推过去, 不靠采样噪声。若发现弯道跟不上, 提到 0.10 再试。
+      vx_max: 0.10      #目标最大前进速度（米/秒） (2026-09-17: 0.15 -> 0.10, 先降速进窄通道)
+      # manda V2.10: vx_min = 0 禁止 FollowPath 自身倒车。
+      #   配合规划器 DUBIN (只生成前进路径), 正常导航全链路无倒车。
+      #   倒车脱困改由行为树的 <BackUp> 完成 —— 它由 behavior_server 直接
+      #   发布速度, 不经过 MPPI 的 vx_min 限制, 因此仍能工作。
+      #   而底盘 allow_reverse=true 是给 BackUp 留的通道, 不能关。
+      vx_min: 0.0       #目标最大反向速度（米/秒）— 0 表示正常跟踪不允许倒车
+      vy_max: 0.0       #如果使用Omni运动模型，目标最大横向速度（m/s），阿克曼设0
+      wz_max: 0.20      #最大旋转速度（弧度/秒） (2026-09-17: 0.30 -> 0.20)
+                        # ⚠ 必须保持 R_min = vx_max / wz_max = 0.10 / 0.20 = 0.50m,
+                        #   与 min_turning_r / Smac minimum_turning_radius /
+                        #   底盘 native_min_turning_radius 四处严格相等。
+                        #   只改速度不改几何, 不破坏 0.50m 阿克曼能力, 只是降速。
+                        # Nav2 限值 <= 底盘限值(0.15/0.30) 依然成立, 不会被静默削顶。
+      # 注意: Humble 版 MPPI 没有 ax_max/az_max/ay_max 参数
+      # (源码 optimizer.cpp 只读 vx_max/vx_min/vy_max/wz_max/vx_std/vy_std/wz_std)。
+      # 加速度限制实际由两层负责, 改这两层才有用:
+      #   1) velocity_smoother 的 max_accel/max_decel (本文件下方)
+      #   2) 底盘桥的 max_linear_accel / max_angular_accel (manda_param.yaml)
+      # 两处必须相等, 否则底盘会静默削顶 -> "以为按 a 走、实际落后" -> 跟踪误差。
+      iteration_count: 1 #迭代次数
+      prune_distance: 1.5 #路径上距离机器人最近点的距离（米）
+      # 在 REEDS_SHEPP 路径的前进/倒车切换点停车换向。
+      # PathAngleCritic mode=2 会按 Smac 给出的可行朝向与行驶方向跟踪。
+      # 与 PreferForwardCritic 同时使用时后者必须关闭, 否则局部控制器
+      # 会与全局规划出来的倒车段打架。
+      enforce_path_inversion: true
+      inversion_xy_tolerance: 0.15
+      inversion_yaw_tolerance: 0.35
+      transform_tolerance: 0.1 #使用 TF（s）进行数据转换的时间容差
+      temperature: 0.3 #根据成本选择轨迹，0表示使用成本最佳的控制
+      gamma: 0.015 #平滑度（高）和低能耗（低）之间的权衡,保持默认值
+      motion_model: "Ackermann" #用于轨迹规划的所需运动模型。
+      visualize: false #是否发布调试轨迹以供可视化。
+      TrajectoryVisualizer: #轨迹可视化
+        trajectory_step: 5 #轨迹之间的步骤可视化以对候选轨迹池进行下采样
+        time_step: 3 #轨迹上点之间的步骤可视化以降低轨迹密度的采样
+      AckermannConstraints:
+        min_turning_r: 0.50 #Manda 最小转弯半径, 与 Smac minimum_turning_radius 严格统一
+      critics: ["ConstraintCritic", "ObstaclesCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic", "PathAngleCritic", "PreferForwardCritic"] #评论插件
+      ConstraintCritic: #修复超出设定的动态或运动学约束的轨迹
+        enabled: true
+        cost_power: 1 
+        cost_weight: 4.0  #权重参数
+      
+      GoalAngleCritic: #当距离目标较近时，GoalAngleCritic会激励导航以达到目标姿势的角度
+        enabled: true
+        cost_power: 1
+        # manda V2.09: 权重 2.0 -> 4.0, 介入距离 0.8 -> 1.2m
+        # 这是“到点时就基本对好”的主力: 从 1.2m 外就开始把最终朝向纳入代价,
+        # 而不是等进 XY 容差后才临时修正(那样就得靠原地旋转了)。
+        cost_weight: 4.0 #权重参数 (提高: 让朝向误差更早影响轨迹选择)
+        threshold_to_consider: 1.2  #距离目标 1.2m 内开始关注最终朝向
+
+      GoalCritic: #当距离目标较近时，GoalCritic会激励机器人在空间上向目标导航
+        enabled: true
+        cost_power: 1
+        cost_weight: 15.0 #权重参数
+        threshold_to_consider: 1.4  #机器人与目标之间的最小距离（米），超过此距离则要考虑目标距离成本。
+
+      ObstaclesCritic:
+        enabled: true
+        cost_power: 1
+        repulsion_weight: 1.5 #权重参数，通常优先选择成本较低的空间中的路线。
+        critical_weight: 30.0 #应用于临界碰撞的权重，用于collision_margin_distance防止近距离碰撞
+        consider_footprint: true #窄路必须用车体footprint检查,不能只检查中心点
+        collision_cost: 10000.0 #应用于轨迹中真实碰撞的成本。
+        collision_margin_distance: 0.10 #碰撞边缘距离，应该设置在0.05-0.2之间，请确保将此参数设置为预计机器人需要穿越的最窄空间
+        near_goal_distance: 0.40 #靠近目标的距离（米）停止应用优先障碍物项
+        # ============================================================
+        # manda V2.11: 与 local_costmap 的膨胀层严格统一 (0.20/3.0 -> 0.45/3.0)
+        # ------------------------------------------------------------
+        # 这两个参数在 obstacles_critic.cpp 里的真实用途 (不是设阈值!):
+        #   inflation_radius_     -> 只用于排斥项 (inflation_radius_ - dist_to_obj),
+        #                            表示“从多远开始被排斥”
+        #   cost_scaling_factor_  -> 用于 distanceToObstacle() 从代价图反解距离:
+        #        dist = (k*inscribed - log(cost) + log(253)) / k
+        #     所以它必须等于 local_costmap 膨胀层的 cost_scaling_factor,
+        #     否则反解出的距离是错的, 排斥/临界惩罚全错位。
+        #
+        # 旧值 0.20 与膨胀层同样落在“悬崖”里: cost>0 的区域只有 0~0.20m,
+        # 该范围内代价全是 253 -> 反解 dist 后仍可能小于 collision_margin,
+        # 导致“要么无代价、要么直接临界重罚”, 中间没有平滑过渡。
+        # 统一到 0.45 后, 0.26~0.45m 这段才真正有可用梯度:
+        #   靠近墙 -> dist_to_obj 变小 -> repulsion 平滑增大 -> 提前回正。
+        # 注意 consider_footprint=true 时 MPPI 仍会独立做 footprint 碰撞检查,
+        # 所以 0.45 不会导致“通道被误判为不可通行”。
+        # ============================================================
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.45  #与局部/全局代价地图膨胀半径一致 (2026-09-17: 0.20 -> 0.45)
+
+      PreferForwardCritic: #激励机器人前进，而不是后退
+        # manda V2.10: 恢复启用。
+        # 现在规划器是 DUBIN (纯前进路径), 且 vx_min=0 已禁止 MPPI 倒车,
+        # 不会再与"规划出的倒车段"冲突 (那个冲突是 REEDS_SHEPP 时代的问题)。
+        # 启用它可以抑制 MPPI 采样出向后的轨迹, 让前进更果断。
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0 #权重参数
+        threshold_to_consider: 0.5 #机器人与目标之间的距离（米）停止考虑前锋并允许目标批评家接管。
+
+      PathAlignCritic:  #PathAlignCritic会激励机器人与全局路径保持一致。
+        enabled: true
+        cost_power: 1
+        cost_weight: 10.0 #权重参数，降低路径朝向牵引强度
+        max_path_occupancy_ratio: 0.07 #最大路径占用率
+        trajectory_point_step: 4
+        threshold_to_consider: 0.8 #机器人与目标之间的距离阈值，减少过早对齐
+        offset_from_furthest: 20 #最远偏移量
+        use_path_orientations: true #REEDS_SHEPP 路径含可行车辆朝向, MPPI 应遵循这些朝向
+
+      PathAngleCritic: #路径角度评论，机器人在因累积角度误差较大而需要时进行急转弯。
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0 #manda V2.09: 2.0 -> 3.0, 提高路径朝向跟随强度
+        offset_from_furthest: 4 #最远偏移量
+        threshold_to_consider: 0.8 #放宽介入范围，减少抖动
+        max_angle_to_furthest: 1.0 #机器人与目标之间的角距离
+        # mode: 2 = 按照 Smac 等可行规划器给出的路径朝向和行驶方向跟踪。
+        # 这是 Reeds-Shepp 倒车段能被正确执行的关键 —— 若用 mode 0/1,
+        # 控制器会把"应当倒车"的路径点当成"要正向开到那里", 与规划打架。
+        mode: 2
+
+      PathFollowCritic: #路径跟随评论家激励机器人沿着路径前进。
+        enabled: true
+        cost_power: 1
+        cost_weight: 18.0 #权重参数，保留跟随但降低拉扯感
+        offset_from_furthest: 5
+        threshold_to_consider: 1.0 #更早交给目标相关代价收敛
+
+controller_server_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0    #成本地图更新频率
+      publish_frequency: 2.0   #将成本图发布到话题的频率
+      global_frame: odom_combined       #局部代价地图用里程计坐标(全局代价地图仍为map)
+      robot_base_frame: base_footprint  #机器人底座框架
+      use_sim_time: False  #仿真时间
+      rolling_window: true #成本地图是否应随机器人基座框架滚动
+      width: 3             #代价地图的宽度（m）
+      height: 3            #代价地图的高度（m）
+      resolution: 0.05     #代价地图1像素的分辨率，以米为单位
+      footprint: "[ [-0.365, -0.25], [-0.365, 0.25],[0.365,0.25],[0.365, -0.25] ]"  #Manda 车体真实尺寸 0.73m x 0.50m
+      plugins: ["voxel_layer","inflation_layer"] #插件包括:{“体素层”，“障碍层”，“膨胀层”}
+      # ============================================================
+      # manda V2.11: 膨胀半径 0.20 -> 0.45 (修复"悬崖式"代价分布)
+      # ------------------------------------------------------------
+      # 事实推导 (footprint.cpp + inflation_layer.hpp + 运行日志):
+      #   footprint "[[-0.365,-0.25],...]" 是相对 base_footprint 的,
+      #   Nav2 会再加 footprint_padding(默认 0.01) -> x±0.375 / y±0.26
+      #   inscribed_radius    = 0.26   (最近边到中心距离)
+      #   circumscribed_radius = sqrt(0.375²+0.26²) = 0.4563
+      # 旧值 0.20 < 0.26 属非法配置, 日志一直在报 ERROR:
+      #   "The configured inflation radius (0.200) is smaller than the
+      #    computed inscribed radius (0.260) of your footprint"
+      #
+      # 【真正的病因】inflation_layer.hpp computeCost(d):
+      #    d == 0            -> LETHAL(254)
+      #    d <= inscribed    -> INSCRIBED(253)   ← 常数, 与 d 无关!
+      #    d >  inscribed    -> 252 * exp(-k*(d-inscribed))
+      #  且 enqueue() 只把 d <= inflation_radius 的 cell 放进膨胀列表。
+      #  于是 inflation_radius=0.20 < inscribed=0.26 时:
+      #    0 ~ 0.20m  : 全部被写成 253  -> 一条 0.20m 厚的纯硬墙
+      #    0.20m 以外 : 膨胀层根本没写 -> 代价 0, 无任何软梯度
+      #  这不是"梯度太窄", 而是**悬崖式**: 要么不可通行, 要么完全自由。
+      #  后果: ① 规划器没有"远离墙"的激励, 1.3m 通道里 0.9m 随便走,
+      #          内侧弧长短 -> 天然切内弯;
+      #        ② MPPI 的 ObstaclesCritic repulsion 项在 cost==0 时跳过,
+      #          贴墙完全不受罚 -> 撞到才猛修 -> 顿挫/停车。
+      #
+      # 【修复原理】把 inflation_radius 抬到明显大于 inscribed_radius,
+      #  才会出现 [inscribed, inflation] 这段指数软梯度:
+      #    0 ~ 0.26m      : 253 硬墙  (车体中心本就该判死, 正确安全边界)
+      #    0.26 ~ 0.45m   : 指数软代价, 越靠墙越高
+      #  1.3m 通道: 中心可走 1.3-2×0.26 = 0.78m,
+      #             两侧各 0.19m 软区, 中间 0.40m 低代价带 -> 自然居中。
+      #  另: MPPI 的 cost_scaling_factor 是"从 cost 反解距离"用的标定值,
+      #     必须等于它所读的 local_costmap 的 cost_scaling_factor。
+      #  三处统一为 3.0 (本处 / global_costmap / MPPI ObstaclesCritic)。
+      #  全局原为 10.0: 衰减过快, 软代价几乎只贴在硬墙边缘 ->
+      #     全局更容易选内侧短路径, 与局部 3.0 形成"全局贴内/局部纠正"拉扯。
+      # ============================================================
+      inflation_layer:                             #膨胀层参数
+        plugin: "nav2_costmap_2d::InflationLayer"  #膨胀层插件。
+        cost_scaling_factor: 3.0                   #成本缩放因子 (与全局/MPPI 统一为 3.0)
+        inflation_radius: 0.45                    #膨胀半径 (2026-09-17: 0.20 -> 0.45, 三处统一)
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"      #体素层插件。
+        enabled: True
+        publish_voxel_map: True
+        origin_z: 0.0                              #体素地图的起始Z坐标
+        z_resolution: 0.05                         #体素地图的Z轴分辨率
+        z_voxels: 16                               #体素地图的Z轴体素数量
+        max_obstacle_height: 2.0                   #可检测障碍物的最大高度（米）
+        mark_threshold: 0                          #标记体素的阈值
+        observation_sources: scan                  #Manda 单雷达
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0                  #可检测障碍物的最大高度（米）
+          clearing: True                            #是否启用障碍物清除功能
+          marking: True                             #是否启用障碍物标记功能
+          data_type: "LaserScan"                    #数据类型
+          raytrace_max_range: 10.0                  #控制光线追踪从代价地图中清除障碍物的最大范围 
+          raytrace_min_range: 0.0                  #控制光线追踪从代价地图中清除障碍物的最小范围 
+          obstacle_max_range: 2.5                   #控制代价地图上标记障碍物的最大范围
+          obstacle_min_range: 0.0                   #控制代价地图上标记障碍物的最小范围
+
+      always_send_full_costmap: True                 #是否每次更新时都发送完整的成本图，而不是更新
+  local_costmap_client:
+    ros__parameters:
+      use_sim_time: False
+  local_costmap_rclcpp_node:
+    ros__parameters:
+      use_sim_time: False
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0             #成本地图更新频率
+      publish_frequency: 1.0            #将成本图发布到话题的频率
+      global_frame: map                 #全局框架
+      robot_base_frame: base_footprint  #机器人底座框架
+      use_sim_time: False               #仿真时间 
+      footprint: "[ [-0.365, -0.25], [-0.365, 0.25],[0.365,0.25],[0.365, -0.25] ]"  #Manda 车体真实尺寸 0.73m x 0.50m
+      resolution: 0.05                  #全局地图1像素的分辨率，以米为单位
+      track_unknown_space: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"] #插件包括：{“静态层”，“障碍层”，“膨胀层”}
+      obstacle_layer:  #障碍层参数
+        plugin: "nav2_costmap_2d::ObstacleLayer" #障碍层插件
+        enabled: True
+        observation_sources: scan                  
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0                 #可检测障碍物的最大高度（米）
+          clearing: True                           #是否启用障碍物清除功能
+          marking: True                            #是否启用障碍物标记功能
+          data_type: "LaserScan"                   #数据类型
+          raytrace_max_range: 10.0                 #控制光线追踪从代价地图中清除障碍物的最大范围 
+          raytrace_min_range: 0.0                  #控制光线追踪从代价地图中清除障碍物的最小范围 
+          obstacle_max_range: 2.5                  #控制代价地图上标记障碍物的最大范围
+          obstacle_min_range: 0.0                  #控制代价地图上标记障碍物的最小范围
+      static_layer: #静态层参数
+        plugin: "nav2_costmap_2d::StaticLayer"     #静态层插件
+        map_subscribe_transient_local: True
+      inflation_layer: #膨胀层参数
+        plugin: "nav2_costmap_2d::InflationLayer"  #膨胀层插件
+        # manda V2.11: 10.0 -> 3.0, 与 local_costmap / MPPI 严格统一。
+        # 原 10.0 衰减过快, 软代价几乎只贴在硬墙(0.26m)边缘, 全局规划器
+        # 感受不到"靠墙有代价" -> 在弧形通道里选内侧短路径;
+        # 而局部 MPPI 用 3.0 认为靠墙代价高 -> 全局贴内/局部纠正互相拉扯,
+        # 表现为左右修正、顿挫甚至停车。统一后两层代价分布一致。
+        cost_scaling_factor: 3.0                   #成本缩放因子 (与局部/MPPI 统一为 3.0)
+        inflation_radius: 0.45                    #膨胀半径 (2026-09-17: 0.20 -> 0.45, 三处统一)
+      always_send_full_costmap: True               #是否每次更新时都发送完整的成本图，而不是更新
+  global_costmap_client:
+    ros__parameters:
+      use_sim_time: False
+  global_costmap_rclcpp_node:
+    ros__parameters:
+      use_sim_time: False
+
+map_server:
+  ros__parameters:
+    use_sim_time: False
+    yaml_filename: "WHEELTEC.yaml"   #Manda 保存地图路径
+
+map_saver:
+  ros__parameters:
+    use_sim_time: False
+    save_map_timeout: 5.0                #尝试保存地图的超时时间（秒）
+    free_thresh_default: 0.196           #Manda 建图 free_thresh
+    occupied_thresh_default: 0.65        #占用网格的占用空间最小概率阈值
+    map_subscribe_transient_local: True  #地图话题的 QoS 设置
+
+planner_server: #规划器服务器参数
+  ros__parameters:
+    # manda V2.08: 只保留一个规划器 (原 ForwardPlanner + ManeuverPlanner 已合并)。
+    # 为什么选 REEDS_SHEPP 而不是 DUBIN:
+    #   规划模型  前进  倒车  死胡同退出
+    #   DUBIN     ✅    ❌    ❌ 无法保证
+    #   REEDS_SHEPP ✅   ✅    ✅ 空间允许时可以
+    # "进入死胡同还能出来"的不可回避条件: 必须允许受控倒车。
+    # reverse_penalty 只在 REEDS_SHEPP 下有效, 2.0 表示正常偏向前进,
+    # 但在必要时仍允许倒车。原地旋转替代不了倒车 —— 狭窄死胡同可能没有
+    # 足够空间让 0.73m × 0.50m 车体旋转。
+    planner_plugins: ["HybridPlanner"]
+    use_sim_time: False
+    expected_planner_frequency: 1.0     #预期的规划器频率。如果当前频率小于预期频率，则显示警告消息。
+    HybridPlanner:
+      plugin: "nav2_smac_planner/SmacPlannerHybrid" #Smac Hybrid-A* 规划器
+      tolerance: 0.10                      # 规划容差 (单位m)
+      downsample_costmap: false           # 是否将代价图下采样至另一个分辨率以进行搜索
+      downsampling_factor: 1              # 对代价图进行下采样的乘数因子
+      allow_unknown: false                # 允许在未知空间搜索
+      max_iterations: 1000000             # 失败前搜索的最大迭代次数
+      max_on_approach_iterations: 1000    # 在公差范围内尝试达到目标的最大迭代次数
+      max_planning_time: 5.0              # 规划器进行规划、平滑和上采样的最大时间（以秒为单位）。
+      # manda V2.10: 改回 DUBIN (只生成前进路径)!
+      # ------------------------------------------------------------
+      # 为什么从 REEDS_SHEPP 改回 DUBIN:
+      #   REEDS_SHEPP 会把"倒车"当作与前进平等的候选。当起点与终点共线
+      #   (例如 去 A 点后回起点), 直线倒车是代价最低的解, 于是出现
+      #   "全程一直倒车" —— 这不是 bug 而是 REEDS_SHEPP 的最优解,
+      #   但不符合使用预期。
+      #   DUBIN 只能前进, 从根上禁掉了"把倒车当常规路径"这件事。
+      # 代价(必须知道):
+      #   1. 目标在车后方时, DUBIN 只能规划"前进绕大弯"返回;
+      #      如果空间不够掉头(需要直径 2×minimum_turning_radius = 2m), 规划失败。
+      #   2. 失败后由行为树恢复动作"直线倒退 0.30m → 重新规划"兜底。
+      #   3. reverse_penalty 在 DUBIN 下不再起作用 (保留仅为切换回去时省事)。
+      motion_model_for_search: "DUBIN"
+      cost_travel_multiplier: 2.0         #应用于搜索以避开高成本区域的成本乘数。
+      angle_quantization_bins: 72         #用于 SE2 搜索的角度箱数量。
+      analytic_expansion_ratio: 3.5       #规划器将尝试以与该值和最小启发式方法成比例的频率完成分析扩展。
+      analytic_expansion_max_length: 4.0  #分析扩展最大长度(R=0.5m, 8倍半径)
+      analytic_expansion_max_cost: 200.0
+      minimum_turning_radius: 0.50        #Manda 最小转弯半径, 与 MPPI AckermannConstraints.min_turning_r 严格统一
+      reverse_penalty: 2.0                #仅在 REEDS_SHEPP 下有效; 当前用 DUBIN, 此值不起作用
+      change_penalty: 0.0                 #如果在搜索中改变方向（例如从左到右），则对 SE2 节点应用启发式惩罚。
+      non_straight_penalty: 1.20          #如果在非直线方向上搜索，则对 SE2 节点应用启发式惩罚。
+      cost_penalty: 2.0                   #应用于 SE2 节点的姿势成本的启发式惩罚。
+      lookup_table_size: 20.0               #距离窗口的缓存大小
+      cache_obstacle_heuristic: True        #缓存障碍启发式
+      smooth_path: true
+      smoother:
+        max_iterations: 1000 #平滑器平滑路径的最大迭代次数，以限制潜在的计算。
+        w_smooth: 0.3 #应用于平滑数据点的平滑权重
+        w_data: 0.2 #应用权重平滑以保留原始数据信息
+        tolerance: 1.0e-10 #终止平滑会话的参数容差变化量
+
+planner_server_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: false
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10 #TF transform tolerance.
+      max_its: 1000
+      do_refinement: True
+
+# ============================================================
+# manda V2.09: 恢复行为服务器
+# ------------------------------------------------------------
+# 重要: spin 插件必须保留!
+#   即使我们的 navigate_single_mode.xml 已删除 <Spin/>, bt_navigator 在激活时
+#   还会去加载 default_nav_through_poses_bt_xml 指向的行为树。如果该参数未设置
+#   (默认回退到 nav2 自带的 navigate_through_poses_w_replanning_and_recovery.xml),
+#   那个 BT 里含 <Spin> —— 此时若 behavior_server 不提供 /spin action server,
+#   bt_navigator 激活会直接报错:
+#       "Exception when loading BT: Action server spin not available"
+#       "Error loading XML file: .../navigate_through_poses_...xml"
+#   后果: bt_navigator 永远停在 inactive, RViz 发 2D Pose Goal 毫无反应。
+#   (这就是去掉 spin 后出现的回归, 已恢复)
+#
+# 另注: global_frame 在本 Humble 版本里叫 global_frame (新版才叫 local_frame),
+#       Spin/BackUp 都从它取全局位姿; robot_base_frame 必须与底盘一致
+#       (base_footprint), 否则 TF 查不到直接 FAILED。
+# 插件名格式以本机默认文件为准: nav2_behaviors/Spin (斜杠, 非 ::)
+# ============================================================
+behavior_server:
+  ros__parameters:
+    use_sim_time: False
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    global_frame: odom_combined
+    robot_base_frame: base_footprint
+    transform_tolerance: 0.2
+    simulate_ahead_time: 2.0
+    # 自旋速度与底盘 max_spin_angular_vel (0.20) 一致
+    max_rotational_vel: 0.20
+    min_rotational_vel: 0.03
+    # 与底盘 max_angular_accel (0.30) 一致, 保持同一条加速度预算
+    rotational_acc_lim: 0.30
+
+behavior_server_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+# ============================================================
+# manda V2.09: 速度平滑器
+# ------------------------------------------------------------
+# 作用: 在控制器/行为服务器与底盘之间再做一层限速 + 限加速度 + 插值,
+#       避免突然加速和电机冲击。链:
+#   controller_server / behavior_server
+#        ↓  /cmd_vel_nav
+#   velocity_smoother
+#        ↓  /cmd_vel
+#   chassis_bridge_node
+#
+# 取值依据(均 <= 底盘上限, 不得越界):
+#   max_velocity <= 底盘 max_forward_speed/max_reverse_speed/max_angular_vel
+#   max_accel    <= 底盘 max_linear_accel/max_angular_accel
+# 减速度比加速度大 —— 兼顾丝滑起步与准确停车:
+#   以 v=0.15 m/s、a=0.30 m/s² 估算制动距离 d = v²/(2a) ≈ 3.8 cm,
+#   不会出现"到点后慢慢磨很久"或明显越过目标。
+# scale_velocities=true: 同时缩放 vx/wz, 尽量保持曲率关系 R=v/w
+#   (若只限 vx 不限 wz, 转弯半径会变小, 可能超底盘 R_min)。
+# feedback=OPEN_LOOP: 用上一拍命令当作当前速度, 不依赖 odom。
+#   odom_topic 仍写对, 以后改 CLOSED_LOOP 时不用再排查。
+# ============================================================
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: False
+    smoothing_frequency: 20.0
+    scale_velocities: True
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.10, 0.0, 0.20]
+    # min_velocity[0] 必须容纳 BackUp 的倒车速度 (backup_speed = 0.05),
+    # 否则 BackUp 发出的 -0.05 会被平滑器直接压成 0 -> 完全无法倒车脱困。
+    min_velocity: [-0.05, 0.0, -0.20]
+    # manda V2.11: 随 MPPI 降速一同下调 (0.15/0.30 -> 0.10/0.15),
+    # 均 <= 底盘 max_linear_accel(0.15) / max_angular_accel(0.30), 不会被静默削顶。
+    max_accel: [0.10, 0.0, 0.15]
+    max_decel: [-0.12, 0.0, -0.20]
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+    odom_topic: "/odom_combined"
+    odom_duration: 0.1
+
+velocity_smoother_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+robot_state_publisher:
+  ros__parameters:
+    use_sim_time: False
+
+waypoint_follower:
+  ros__parameters:
+    loop_rate: 20 #循环速率
+    stop_on_failure: false #如果单个航点失败，是否使操作任务失败。如果为 false，将继续到下一个航点。
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200 #机器人到达每个航点后休眠/等待的时间（以毫秒为单位）

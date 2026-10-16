@@ -1,0 +1,66 @@
+# =============================================================================
+# slam_toolbox 在线异步建图配置
+# 输入: /scan (激光) + TF (odom->base_footprint, 来自 EKF)
+# 输出: /map + map->odom TF
+# =============================================================================
+slam_toolbox:
+  ros__parameters:
+    # ---- 求解器 ----
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # ---- 坐标系 ----
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_footprint       # 与 EKF 输出一致
+    scan_topic: /scan
+
+    # ---- 模式 ----
+    mode: mapping                    # 建图模式 (非 localization)
+
+    # ---- 地图 ----
+    map_file_name: ""
+    map_start_pose: [0.0, 0.0, 0.0]
+    resolution: 0.05
+    max_laser_range: 10.0
+    minimum_laser_range: 0.2
+
+    # ---- 扫描匹配 ----
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.1
+    minimum_travel_heading: 0.174   # ~10度
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+
+    # ---- 回环检测 ----
+    do_loop_closing: true
+    loop_search_maximum_distance: 3.0
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # ---- 相关器 ----
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    # ---- 更新 ----
+    map_update_interval: 5.0
+    minimum_time_interval: 0.5
+    # TF 发布频率：0.05 = 20Hz，解决 map 坐标系下点云断裂问题
+    transform_publish_period: 0.05
+    # 放宽 TF 等待时间，避免算力波动时丢弃雷达帧
+    transform_timeout: 0.5
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+
+    # ---- 可视化 ----
+    enable_interactive_mode: true

@@ -1,0 +1,508 @@
+# ==========================================================
+# Nav2 2D 导航配置 — 纯阿克曼 (Ackermann) 实车配置
+# 配合 bringup_navigation.launch.py / bringup_all.launch.py 使用
+#
+# 【本文件定位】备用启动链路 (./bringup.sh nav)。
+#   标准导航入口是:
+#       ros2 launch wheeltec_nav2 wheeltec_nav2.launch.py
+#   它走 param_manda.yaml (由 turn_on_wheeltec_robot_01/config/
+#   wheeltec_param.yaml 的 car_mode: manda 决定)。
+#   两套配置已同步为完全一致的纯阿克曼参数, 以免误启动时行为不一致。
+#
+# 【运动学口径】底盘为 4WID-4WIS (四轮独立转向), 已从 Swerve 降级为
+#  纯阿克曼: 仅 linear.x + angular.z, linear.y 被桥接层忽略。
+#  桥接层几何(图纸): 半轴距 a=0.24m, 半轮距 b=0.19m。
+#
+# 【无任何原地旋转通路】
+#   本车只有 0x01 前后轮阿克曼一种运动能力, 转向必须依赖车身前进或倒车。
+#   因此本文件:
+#     · behavior_plugins 不含 spin (不提供 /spin action)
+#     · 两份 BT 均无 <Spin> 节点 (恢复动作用 <Wait> 占位)
+#     · MPPI 使用 AckermannConstraints, 底盘层在 CAN 出口再做一次整形
+#   底盘侧约束: |Vx| < 0.005 → Vx=Vz=0; 否则 |Vz| <= |Vx| / 0.50
+#
+# 【最小转弯半径 = 0.50m (车体中心)】
+#   底盘跑 0x01 前后轮反向阿克曼, ICR 在车体中心横截面上, 故:
+#     内轮 = atan(a/(R-b)) = atan(0.24/0.31) = 37.75°
+#     外轮 = atan(a/(R+b)) = atan(0.24/0.69) = 19.18°
+#   45° 仅作为机械安全上限 (对应几何极限 R=0.43m), 不是工作角。
+#   以下三处必须严格同值, 否则规划/控制/执行不一致:
+#     本文件 Smac   minimum_turning_radius: 0.50
+#     本文件 MPPI   AckermannConstraints.min_turning_r: 0.50
+#     底盘桥        native_min_turning_radius: 0.50
+#   (= vx_max / wz_max = 0.10 / 0.20 = 0.50, 四处自洽)
+# ==========================================================
+
+# ============================================================================
+# 0. map_server — 由 RewrittenYaml 注入 yaml_filename
+# ============================================================================
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    yaml_filename: ""
+    bond_heartbeat_period: 2.0
+
+# ============================================================================
+# 1. 局部代价地图
+# ============================================================================
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 10.0
+      publish_frequency: 6.0
+      global_frame: odom
+      robot_base_frame: base_footprint
+      use_sim_time: false
+      transform_tolerance: 0.5
+      rolling_window: true
+      width: 4
+      height: 4
+      resolution: 0.05
+      footprint_padding: 0.03
+      footprint: "[[0.35, 0.25], [0.35, -0.25], [-0.35, -0.25], [-0.35, 0.25]]"
+      plugins: ["obstacle_layer", "inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        # 必须 >= inscribed_radius (0.26m): 否则代价图在 0~inscribed 整片
+        #   被置为 INSCRIBED(253) 常量, 而 enqueue() 只覆盖 d <= inflation_radius,
+        #   导致 >inflation_radius 处 cost 直接掉到 0 —— 完全没有梯度。
+        #   Nav2 启动时会报 "inflation_radius is less than inscribed_radius"。
+        # 0.30 保留约 0.04m 的缓冲带, 让狭窄通道也有可用的代价梯度。
+        inflation_radius: 0.30
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        max_obstacle_height: 2.0
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          inf_is_valid: true
+          observation_persistence: 0.2
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 4.0
+          obstacle_min_range: 0.0
+      always_send_full_costmap: true
+
+# ============================================================================
+# 2. 全局代价地图
+# ============================================================================
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 3.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_footprint
+      use_sim_time: false
+      transform_tolerance: 0.5
+      footprint: "[[0.35, 0.25], [0.35, -0.25], [-0.35, -0.25], [-0.35, 0.25]]"
+      footprint_padding: 0.03
+      resolution: 0.05
+      track_unknown_space: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 12.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 6.0
+          obstacle_min_range: 0.0
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        # 同 local_costmap: 必须 >= inscribed_radius (0.26m), 否则无梯度
+        inflation_radius: 0.30
+      always_send_full_costmap: true
+
+# ============================================================================
+# 3. 路径规划器
+# ============================================================================
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 2.0
+    use_sim_time: false
+    # 插件名必须是 HybridPlanner: 两份行为树里的 planner_id 都写的是
+    #   "HybridPlanner"。早期本文件叫 "GridBased" (官方默认名), 会导致
+    #   找不到规划器 —— 行为树里的 planner_id 与插件列表必须逐字一致。
+    planner_plugins: ["HybridPlanner"]
+    HybridPlanner:
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      tolerance: 0.25
+      downsample_costmap: false
+      downsampling_factor: 1
+      allow_unknown: false
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 3.0                                # (2026-09-17: 5.0 -> 3.0 脱困提速)
+      cost_travel_multiplier: 5.0
+      use_final_approach_orientation: false
+      motion_model_for_search: "DUBIN"
+      angle_quantization_bins: 72
+      # 非全向 (Ackermann): 车体中心最小转弯半径 0.50m
+      # (内轮 37.75° / 外轮 19.18°, 与 MPPI min_turning_r 和底盘 native_min_turning_radius 同值)
+      # 注意: 若改用 REEDS_SHEPP 允许倒车脱困, 此值仍必须保持 0.50
+      minimum_turning_radius: 0.50
+      analytic_expansion_ratio: 0.0
+      analytic_expansion_max_length: 0.0
+      reverse_penalty: 1.2
+      change_penalty: 0.6
+      non_straight_penalty: 2.0
+      cost_penalty: 4.0
+      retrospective_penalty: 0.015
+      lookup_table_size: 20.0
+      cache_obstacle_heuristic: true
+      smooth_path: true
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+        do_refinement: true
+        refinement_num: 2
+
+# ============================================================================
+# 4. 控制器 — MPPI (nav2_mppi_controller) + 阿克曼约束
+# ============================================================================
+# 【本文件的运动学口径 = 纯前后轮阿克曼 0x01】
+#   与 param_manda.yaml (标准启动链路) 保持完全一致。
+#   本车不接受任何形式的原地旋转: 转向必须依赖车身前进或倒车。
+# ============================================================================
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.01
+    min_y_velocity_threshold: 0.01
+    min_theta_velocity_threshold: 0.05
+    # manda V2.19: 控制器故障容忍 (默认 0.0 = 首次失败即终止目标)
+    #   MPPI 在终点的瞬时失败 (TF 外推错误 -> 空路径 -> "0 poses in it")
+    #   在 0.0 时会立刻终止目标, 触发 BT 恢复 ClearCostmap + BackUp + Wait,
+    #   表现为车往前/往后抽一下 —— 即用户说的"抖动"。
+    #   1.0s 内只发零速(车稳住), 容忍不过去才进恢复。
+    failure_tolerance: 1.0
+    progress_checker_plugin: "progress_checker"
+    # 插件名与 param_manda.yaml 保持逐字一致 (goal_checker)
+    goal_checker_plugins: ["goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.5
+      # 必须 >= 30.0: 阿克曼无法原地旋转, 到点后修正航向必须走圆弧。
+      # 0.18rad 的航向误差需要 0.09m 圆弧 (R=0.50), 而 required_movement_radius
+      # 是 0.5m —— 若给 10s 而车以 0.10m/s 走完这段只需 <1s 却仍被判"未移动",
+      # 会直接触发 BackUp 恢复, 表现为"到点后一会儿摸一下、倒一下、再前进"。
+      movement_time_allowance: 15.0   # (2026-09-17: 30.0 -> 15.0, 原地旋转已删除, 无需为终点磨姿态留 30s)
+
+    goal_checker:
+      stateful: true
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.30
+      # ============================================================
+      # manda V2.19: 到点即停 —— yaw 0.35 -> 0.60 rad (≈34.4°), xy 0.20 -> 0.30
+      # ------------------------------------------------------------
+      # 抖动来源: SimpleGoalChecker 要求 XY **且** yaw 同时满足。
+      #   本车不能原地旋转 + vx_min 不许倒车 => 改 yaw 只能"向前走圆弧",
+      #   于是出现 GoalCritic 与 GoalAngleCritic 互相拉扯的小幅往复,
+      #   叠加 MPPI 采样噪声 -> "原地抖动"; 抖满 30s 还会触发 BackUp 倒退。
+      # 放宽到 0.60 后, 入点残差通常已在其内 -> 一进 xy 容差立即判定到达,
+      #   controller_server 跳出循环并 publishZeroVelocity() -> 车直接停住。
+      # 代价: 停车姿态最多偏约 34°; 对姿态敏感的点位可收到 0.45 (≈26°)。
+      # ============================================================
+      yaw_goal_tolerance: 0.60
+
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      # --- 采样与前瞻参数 ---
+      time_steps: 80
+      model_dt: 0.08
+      batch_size: 1500
+      iteration_count: 1
+      temperature: 0.4
+      gamma: 0.015
+
+      # --- 运动学模型设定 (非全向 Ackermann) ---
+      motion_model: "Ackermann"
+      # 参数键名必须是 AckermannConstraints.min_turning_r (MPPI 源码写死):
+      #   motion_models.hpp: getParamGetter("AckermannConstraints") + "min_turning_r"
+      # 旧配置写的 ackermann_constraints.min_turning_radius 两个部分都不匹配,
+      # 被 declare_parameter_if_not_declared 静默创建了一个没人读的参数,
+      # 实际生效的一直是默认值 0.2 -> 转弯约束完全没起作用。
+      AckermannConstraints:
+        min_turning_r: 0.50
+
+      # --- 速度与采样范围限制 ---
+      # 【封杀 Y 轴】vy_std/vy_max/vy_min 全为 0, 禁止横向平移。
+      # vx_std/wz_std 取 0.06/0.08: 比早期 0.10/0.20 更小, 让 MPPI 采样更集中,
+      #   实测能减少"狭窄通道里左右来回掂量"的抖动。
+      vx_std: 0.06
+      vy_std: 0.0
+      wz_std: 0.08
+
+      # 【速度与半径必须自洽】omega_max = vx_max / R_min = 0.10/0.50 = 0.20
+      #   vx_max=0.10 (低于底盘 max_forward_speed 0.15, 留出安全余量)
+      #   wz_max=0.20 (与底盘 max_angular_vel 0.30 兼容, 且满足 R=0.50)
+      # 若 vx_max/wz_max 不同步改, 全速时 R = 0.10/0.20 = 0.50m 才能达到;
+      # 若 wz_max 取 0.15 则 R 被算成 0.67m -> 半径参数改了也转不了小弯。
+      #
+      # 注意: MPPI (Humble) 没有 ax_max/az_max 参数, 加速度上限由
+      #   velocity_smoother (max_accel/max_decel) 与底盘斜坡 max_linear_accel_/
+      #   max_angular_accel_ 负责, 不要在这里写 ax_max/az_max (无效键)。
+      vx_max: 0.10
+      vx_min: -0.05
+      vy_max: 0.0
+      vy_min: 0.0
+      wz_max: 0.20
+
+      # --- 批评家 (Critics) 权重配置 ---
+      critics: [
+        "ConstraintCritic",
+        "ObstaclesCritic",
+        "GoalCritic",
+        "GoalAngleCritic",
+        "PathAlignCritic",
+        "PathFollowCritic",
+        "PreferForwardCritic"
+      ]
+
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+
+      ObstaclesCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 30.0
+        repulsion_weight: 10.0
+        critical_cost: 300.0
+        consider_footprint: true
+
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 1.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 1.0
+        threshold_to_consider: 1.4
+
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 15.0
+
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+
+# ============================================================================
+# 4.5 velocity_smoother — 速度平滑 / 加速度限制
+# ----------------------------------------------------------------------------
+# 本节点由 nav2_bringup/navigation_launch.py 启动, 接线为:
+#   controller_server --cmd_vel_nav--> velocity_smoother --cmd_vel--> 底盘桥
+# 之前本文件没有这段, 节点用的是 nav2 默认值 max_velocity [0.26, 0, 1.0],
+# 比底盘实际上限宽松得多, 等于没限制 -> 底盘要静默削顶, 跟踪变差。
+# 这里显式写成与 MPPI / 底盘完全一致的值。
+#
+# wz 上限 = vx 上限 / R_min = 0.15 / 0.50 = 0.30 rad/s (与 MPPI wz_max 一致)
+# max_accel/max_decel 与底盘 max_linear_accel / max_angular_accel 一致
+#   (线 0.15 m/s², 角 0.30 rad/s²), 避免底盘静默削顶。
+# min_velocity 的 vx 留 -0.05 以便行为树 <BackUp> 倒车脱困能通过
+#   (底盘 max_reverse_speed 也是 0.05)。
+# ============================================================================
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    smoothing_frequency: 20.0
+    scale_velocities: False
+    feedback: "OPEN_LOOP"
+    # [vx, vy, wz] — 阿克曼 vy 恒 0
+    max_velocity: [0.10, 0.0, 0.20]
+    min_velocity: [-0.05, 0.0, -0.20]
+    max_accel: [0.15, 0.0, 0.30]
+    max_decel: [-0.15, 0.0, -0.30]
+    # 必须用 EKF 融合输出, 与 controller_server 的 odom_topic 一致
+    odom_topic: "/odom_combined"
+    odom_duration: 0.1
+    # manda V2.19: 死区 0 -> [0.02, 0.0, 0.02]
+    #   velocity_smoother.cpp: |Vx| < deadband[0] 或 |Vz| < deadband[2]
+    #   的命令被改写为精确 0 -> 滤掉静止时的微小指令。
+    #   ⚠ wz 死区**不要设大**: 0.05 会抹掉 R>2.0m 的转向修正,
+    #     而狭小通道里正是靠这种"轻微回正"贴着中线走。
+    #     实测: 未加死区时纯直行占 11~28%, 加 0.05 后飙到 80%+。
+    #   0.02 只吃掉 R>5.0m (近乎直线) 的修正, 保留通道内小修正。
+    deadband_velocity: [0.02, 0.0, 0.02]
+    velocity_timeout: 1.0
+
+# ============================================================================
+# 5. 行为树
+# ============================================================================
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    # ---- 行为插件 ----
+    # 不含 spin: 本车只有 0x01 前后轮阿克曼, 原地旋转在几何上不可实现,
+    #   其纯角速度指令 (Vx=0, Vz≠0) 会在底盘 CAN 出口被归零。
+    #   故不提供 /spin action, 让任何 BT 里的 <Spin> 在加载期就暴露出来。
+    #
+    # ⚠ 必须配套: bt_navigator 会加载 default_nav_through_poses_bt_xml 指向的
+    #   BT, 官方默认那个含 <Spin>. 若 /spin 不存在则报
+    #     "Exception when loading BT: Action server spin not available"
+    #   -> bt_navigator 停在 inactive -> RViz 发目标无反应。
+    #   所以下面 bt_navigator 显式指向了 navigate_through_poses_ackermann.xml。
+    #
+    # backup -> 真正脱困 (倒车 0.30m), 本车支持, 也是原地旋转删除后
+    #           唯一能在狭窄处修正朝向的动作;
+    # wait   -> 无动作等待, 安全。
+    # 不用 drive_on_heading: 它在 Vx=0 时会产生纯角速度指令,
+    #   与阿克曼运动约束冲突 (会被底盘 CAN 出口归零, 白耗恢复预算)。
+    behavior_plugins: ["backup", "wait"]
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    global_frame: odom
+    robot_base_frame: base_footprint
+    transform_tolerance: 0.5
+    simulate_ahead_time: 2.0
+
+# ============================================================================
+# 6. AMCL
+# ============================================================================
+
+# ============================================================================
+# 6. AMCL
+# ============================================================================
+amcl:
+  ros__parameters:
+    use_sim_time: false
+    alpha1: 0.4
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.4
+    alpha5: 0.2
+    base_frame_id: "base_footprint"
+    beam_skip_distance: 0.5
+    beam_skip_error_threshold: 0.9
+    beam_skip_threshold: 0.3
+    do_beamskip: false
+    global_frame_id: "map"
+    lambda_short: 0.1
+    laser_likelihood_max_dist: 2.0
+    laser_max_range: 20.0
+    laser_min_range: 0.15
+    laser_model_type: "likelihood_field"
+    max_beams: 60
+    max_particles: 2000
+    min_particles: 500
+    odom_frame_id: "odom"
+    pf_err: 0.05
+    pf_z: 0.99
+    recovery_alpha_fast: 0.0
+    recovery_alpha_slow: 0.0
+    resample_interval: 1
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    save_pose_rate: 0.5
+    sigma_hit: 0.2
+    tf_broadcast: true
+    transform_tolerance: 1.0
+    update_min_a: 0.2
+    update_min_d: 0.25
+    z_hit: 0.5
+    z_max: 0.05
+    z_rand: 0.5
+    z_short: 0.05
+    set_initial_pose: true
+    always_reset_initial_pose: false
+    first_map_only: false
+    scan_topic: /scan
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+
+# ============================================================================
+# 7. 生命周期 和 导航
+# ============================================================================
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: /odometry/filtered
+    bt_loop_duration: 50   # (2026-09-17: 100 -> 50, 20Hz 降 CPU 占用)
+    default_server_timeout: 20
+    enable_groot_monitoring: true
+    groot_zmq_publisher_port: 1666
+    groot_zmq_server_port: 1667
+    # ---- 行为树 ----
+    # manda V2.06 修复: 原写的 default_bt_xml_filename 是旧版 nav2(Galactic)
+    # 参数名, nav2 1.1.x 完全不认它 -> 空值被静默忽略 -> 实际运行内置默认 BT
+    # (含 RateController hz=1.0, 就是"到点后反复绕圈重规划"的根因)。
+    # 正确参数名为 default_nav_to_pose_bt_xml。
+    #
+    # 【本文件定位】备用启动链路 (bringup.sh nav / bringup_all.launch.py)。
+    #   标准导航入口是 ros2 launch wheeltec_nav2 wheeltec_nav2.launch.py
+    #   (走 param_manda.yaml)。两份配置已同步为一致的纯阿克曼参数,
+    #   以免误启动时行为不一致。
+    default_nav_to_pose_bt_xml: "/nvme/sunrise/manda_cpy/install/wheeltec_nav2/share/wheeltec_nav2/behavior_trees/navigate_forward_backup.xml"
+    # 必须显式指定: 官方默认的 through_poses BT 含 <Spin spin_dist="1.57"/>, 
+    #   而 behavior_plugins 已无 spin -> 加载直接失败, bt_navigator 停在 inactive
+    #   -> RViz 发目标毫无反应。
+    default_nav_through_poses_bt_xml: "/nvme/sunrise/manda_cpy/install/wheeltec_nav2/share/wheeltec_nav2/behavior_trees/navigate_through_poses_ackermann.xml"
+    transform_tolerance: 0.5
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: false
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 0.1
+      max_its: 1000
+      do_refinement: true
+
+lifecycle_manager_localization:
+  ros__parameters:
+    bond_timeout: 20.0
+    bond_respawn_max_duration: 60.0
+    attempt_respawn_reconnection: true
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    bond_timeout: 20.0
+    bond_respawn_max_duration: 60.0
+    attempt_respawn_reconnection: true

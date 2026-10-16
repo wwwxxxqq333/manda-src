@@ -1,0 +1,789 @@
+#include "turn_on_wheeltec_robot_01/manda_can_bridge.h"
+
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <cstring>
+#include <chrono>
+#include <cmath>
+#include <cerrno>
+#include <limits>
+#include <algorithm>
+
+// ============================================================
+// 构造函数: 声明参数、激活 CAN、初始化收发
+// ============================================================
+MandaCanBridge::MandaCanBridge()
+    : Node("manda_can_bridge") {
+    // ---- 声明参数 ----
+    this->declare_parameter("car_model", "manda_4wid_4wis_ackermann");
+    this->declare_parameter("can_device", "can0");
+    this->declare_parameter("bitrate", 500000);
+    this->declare_parameter("use_system_can_setup", true);
+    this->declare_parameter("wheel_base_x", 0.24);
+    this->declare_parameter("wheel_base_y", 0.19);
+    this->declare_parameter("wheel_radius", 0.10);
+    // manda V2.03 安全收敛: 90° 是 atan 渐近边界(cos→0 轮速爆/轮胎侧滑),
+    // 机械虽能转 90°, 但安全上限取 45° (R_min≈0.67m, 转弯不侧滑不打齿)。
+    this->declare_parameter("max_steer_angle", 45.0); // 转向角安全限位 (±度)
+    this->declare_parameter("max_wheel_speed", 2.0);  // 单轮速度上限 (m/s)
+    // manda V2.03: cmd_vel 最大角速度 (rad/s), 超过则 clamp, 防止 Nav2 给过激 wz
+    this->declare_parameter("max_angular_vel", 0.8);  // ≈45°/s
+    this->declare_parameter("velocity_loop_hz", 10.0);
+    this->declare_parameter("watchdog_timeout", 0.5);
+    this->declare_parameter("odom_frame_id", "odom_combined");
+    this->declare_parameter("base_frame_id", "base_footprint");
+    this->declare_parameter("cmd_vel_topic", "/cmd_vel");
+    this->declare_parameter("odom_topic", "/odom_wheel");
+    this->declare_parameter("battery_topic", "/battery_state");
+    this->declare_parameter("joint_state_topic", "/joint_states");
+    // manda 修复: 0x104 运动反馈 vz(角速度) 的单位/标度修正系数。
+    // 若实车转 1 圈 odom 只转一部分, 用 verify_odom_yaw.py 测出误差倍数 scale,
+    // 则此处填 scale 即可 (默认 1.0 = 底盘反馈已是 rad/s 且标度匹配)。
+    this->declare_parameter("vz_scale", 1.0);
+    // 倒车安全门: 默认禁止倒车; 脱困模式可运行时切换 allow_reverse=true
+    this->declare_parameter("allow_reverse", false);
+    this->declare_parameter("max_reverse_speed", 0.08);
+
+    wheel_base_x_ = this->get_parameter("wheel_base_x").as_double();
+    wheel_base_y_ = this->get_parameter("wheel_base_y").as_double();
+    wheel_radius_ = this->get_parameter("wheel_radius").as_double();
+    max_steer_angle_ = this->get_parameter("max_steer_angle").as_double();
+    max_wheel_speed_ = this->get_parameter("max_wheel_speed").as_double();
+    if (max_wheel_speed_ <= 0.0) max_wheel_speed_ = 2.0;
+    max_angular_vel_ = this->get_parameter("max_angular_vel").as_double();
+    if (max_angular_vel_ <= 0.0) max_angular_vel_ = 0.8;
+    wheel_base_  = 2.0 * wheel_base_x_;
+    track_width_ = 2.0 * wheel_base_y_;
+    if (wheel_radius_ <= 0.0) wheel_radius_ = 0.10;
+
+    odom_frame_id_ = this->get_parameter("odom_frame_id").as_string();
+    base_frame_id_ = this->get_parameter("base_frame_id").as_string();
+    vz_scale_ = this->get_parameter("vz_scale").as_double();
+    if (vz_scale_ <= 0.0) vz_scale_ = 1.0;
+
+    double loop_hz = this->get_parameter("velocity_loop_hz").as_double();
+    if (loop_hz <= 0.0) loop_hz = 10.0;
+    loop_ms_ = static_cast<int>(1000.0 / loop_hz);
+
+    watchdog_timeout_ = this->get_parameter("watchdog_timeout").as_double();
+    if (watchdog_timeout_ <= 0.0) watchdog_timeout_ = 0.5;
+
+    std::string car_model = this->get_parameter("car_model").as_string();
+
+    // ---- 0. 自动激活 CAN 接口 ----
+    std::string can_dev = this->get_parameter("can_device").as_string();
+    int bitrate = this->get_parameter("bitrate").as_int();
+    if (this->get_parameter("use_system_can_setup").as_bool()) {
+        std::string cmd = "sudo ip link set " + can_dev + " type can bitrate " + std::to_string(bitrate) + " 2>/dev/null";
+        system(cmd.c_str());
+        cmd = "sudo ip link set up " + can_dev + " 2>/dev/null";
+        system(cmd.c_str());
+        rclcpp::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // ---- 1. 初始化 SocketCAN ----
+    can_socket_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (can_socket_ < 0) {
+        RCLCPP_FATAL(this->get_logger(), "Failed to create CAN socket!");
+        rclcpp::shutdown();
+        return;
+    }
+    struct ifreq ifr{};
+    strcpy(ifr.ifr_name, can_dev.c_str());
+    if (ioctl(can_socket_, SIOCGIFINDEX, &ifr) < 0) {
+        RCLCPP_FATAL(this->get_logger(), "Failed to get CAN interface index for %s!", can_dev.c_str());
+        close(can_socket_);
+        can_socket_ = -1;
+        rclcpp::shutdown();
+        return;
+    }
+    struct sockaddr_can addr{};
+    addr.can_family = AF_CAN;
+    addr.can_ifindex = ifr.ifr_ifindex;
+    if (bind(can_socket_, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        RCLCPP_FATAL(this->get_logger(), "Failed to bind CAN socket to %s!", can_dev.c_str());
+        close(can_socket_);
+        can_socket_ = -1;
+        rclcpp::shutdown();
+        return;
+    }
+
+    // ---- 2. 底盘唤醒: 发送 0x401 进入用户自主控制模式 (0x08) ----
+    RCLCPP_INFO(this->get_logger(), "Sending 0x401 mode=0x08 (User Independent Control / Ackermann Drive)...");
+    struct can_frame mode_frame;
+    mode_frame.can_id = 0x401;
+    mode_frame.can_dlc = 1;
+    mode_frame.data[0] = 0x08;
+    write(can_socket_, &mode_frame, sizeof(struct can_frame));
+    rclcpp::sleep_for(std::chrono::milliseconds(250));
+    RCLCPP_INFO(this->get_logger(), "Chassis mode set to 0x08 (User Independent Control - Ackermann Drive)");
+
+    // ---- 3. 订阅 cmd_vel + 发布 odom / battery / joint_states ----
+    std::string cmd_vel_topic = this->get_parameter("cmd_vel_topic").as_string();
+    std::string odom_topic = this->get_parameter("odom_topic").as_string();
+    std::string battery_topic = this->get_parameter("battery_topic").as_string();
+    std::string joint_state_topic = this->get_parameter("joint_state_topic").as_string();
+
+    cmd_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+        cmd_vel_topic, 10,
+        std::bind(&MandaCanBridge::cmdVelCallback, this, std::placeholders::_1));
+    odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic, 10);
+    battery_pub_ = this->create_publisher<sensor_msgs::msg::BatteryState>(battery_topic, 10);
+    joint_state_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(joint_state_topic, 10);
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
+
+    // ---- 4. 心跳看门狗 ----
+    last_cmd_time_ = this->now();
+    watchdog_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(100),
+        std::bind(&MandaCanBridge::watchdogCheck, this));
+
+    // ---- 5. 循环下发线程 ----
+    velocity_running_ = true;
+    velocity_thread_ = std::thread(&MandaCanBridge::velocityLoop, this);
+
+    // ---- 6. CAN 接收线程 ----
+    receive_thread_ = std::thread(&MandaCanBridge::canReceiveLoop, this);
+    RCLCPP_INFO(this->get_logger(),
+        "Manda CAN Bridge Started! car=%s Wheelbase=%.2fm Track=%.2fm WheelR=%.2fm MaxSteer=%.1fdeg Loop=%dms Watchdog=%.1fs",
+        car_model.c_str(), wheel_base_, track_width_, wheel_radius_, max_steer_angle_, loop_ms_, watchdog_timeout_);
+}
+
+// ============================================================
+// 析构函数
+// ============================================================
+MandaCanBridge::~MandaCanBridge() {
+    receive_running_ = false;
+    velocity_running_ = false;
+    if (velocity_thread_.joinable()) velocity_thread_.join();
+    if (can_socket_ >= 0) close(can_socket_);
+    if (receive_thread_.joinable()) receive_thread_.join();
+}
+
+// ============================================================
+// 数据转换工具 (大端字节序)
+// ============================================================
+inline void MandaCanBridge::speedToCanBytes(float speed_mps, uint8_t &hi, uint8_t &lo) {
+    int16_t scaled = static_cast<int16_t>(speed_mps * 1000.0f);
+    hi = static_cast<uint8_t>((scaled >> 8) & 0xFF);
+    lo = static_cast<uint8_t>(scaled & 0xFF);
+}
+
+inline void MandaCanBridge::angleToCanBytes(float angle_deg, uint8_t &hi, uint8_t &lo) {
+    int16_t scaled = static_cast<int16_t>(angle_deg * 100.0f);
+    hi = static_cast<uint8_t>((scaled >> 8) & 0xFF);
+    lo = static_cast<uint8_t>(scaled & 0xFF);
+}
+
+inline float MandaCanBridge::canBytesToSpeed(uint8_t hi, uint8_t lo) {
+    int16_t raw = static_cast<int16_t>((static_cast<int16_t>(hi) << 8) | lo);
+    return static_cast<float>(raw) / 1000.0f;
+}
+
+inline float MandaCanBridge::canBytesToAngle(uint8_t hi, uint8_t lo) {
+    int16_t raw = static_cast<int16_t>((static_cast<int16_t>(hi) << 8) | lo);
+    return static_cast<float>(raw) / 100.0f;
+}
+
+// ============================================================
+// 纯阿克曼 (Ackermann) 逆运动学
+// 物理模型: 前轮转向 + 后轮直行驱动 (自行车模型扩展)
+//   1. 后轮转角恒为 0 (后轴固定, 不可转向)
+//   2. 旋转瞬心 (ICR) 位于后轴延长线上, 后轴中心横向速度为 0
+//   3. 内侧前轮转角 > 外侧前轮转角 (真正阿克曼几何)
+//   4. 转弯半径受限幅保护 (R_min 由内侧前轮最大转角决定)
+// ============================================================
+void MandaCanBridge::computeAckermannKinematics(float vx, float omega,
+                                                float speeds[4], float angles[4]) {
+    // 纯阿克曼的后轮转角永远为 0
+    angles[1] = 0.0f; // RL
+    angles[3] = 0.0f; // RR
+
+    // 1. 直行模式
+    if (std::abs(omega) < 1e-5) {
+        for (int i = 0; i < 4; i++) {
+            speeds[i] = vx;
+            angles[i] = 0.0f;
+        }
+        return;
+    }
+
+    // 2. 原地旋转保护（纯阿克曼物理上无法原地旋转）
+    if (std::abs(vx) < 0.01) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Pure Ackermann cannot rotate in place. Output zero.");
+        for (int i = 0; i < 4; i++) { speeds[i] = 0.0f; angles[i] = 0.0f; }
+        return;
+    }
+
+    const double L = wheel_base_;      // 前后轴距 (2 * Lx)
+    const double W = track_width_;     // 左右轮距 (2 * Ly)
+    // manda V2.03: max_steer_angle 安全上限 45° (原 90° 是 atan 渐近边界,
+    // cos(90°)=0 轮速会爆 + 轮胎必然侧滑)。45° 时 R_min≈0.67m, 转弯稳。
+    const double max_steer_rad = max_steer_angle_ * M_PI / 180.0;
+    // 内部实际使用最大转角 = 配置值 (45° 时无需额外 hack; 代码仍保留 90° 时的
+    // 防护逻辑以防用户改回大角度)。
+    const double max_steer_rad_eff =
+        (max_steer_rad >= M_PI / 2.0 - 1e-6) ? (M_PI / 2.0 - 0.02) : max_steer_rad;
+
+    // 3. 计算后轴中心的目标转弯半径 R
+    // 约定：omega > 0 为左转，R > 0；omega < 0 为右转，R < 0
+    double R = vx / omega;
+
+    // 计算最小允许转弯半径 (由内侧前轮的最大转角决定)
+    // 注意: max_steer_angle=90° 时 tan→∞, L/tan→0, R_min→W/2 (约 0.19m)。
+    double R_min = L / std::tan(max_steer_rad_eff) + W / 2.0;
+
+    // 4. 曲率限幅 (如果指令要求的转弯半径太小，限制角速度)
+    if (std::abs(R) < R_min) {
+        R = (R > 0) ? R_min : -R_min;
+        omega = vx / R; // 等比例缩小角速度
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Steer angle exceeds %.1f deg! Limiting turning radius to %.2fm",
+            max_steer_angle_, R_min);
+    }
+
+    // ============================================================
+    // manda 修复 (V1.09): 纯阿克曼转角计算, 正确处理右转 (R<0)
+    // ------------------------------------------------------------
+    // 旧实现用 atan2(L, R_L) 直接算转角: 当 R<0 (右转) 时, R_L/R_R 均为负,
+    // atan2 落在第二象限 → 算出 >90° 的荒谬角度 (如 156°), 远超物理限位,
+    // 导致前轮猛打方向 + 车身颤抖。这正是导航"直行却猛打方向"的根因。
+    //
+    // 正确做法: 内侧/外侧前轮转角应关于 R 的符号对称。
+    //   左转 (R>0): delta_FL = +atan(L/r_inner) 内侧 > delta_FR = +atan(L/r_outer) 外侧
+    //   右转 (R<0): delta_FL = -atan(L/r_outer) 外侧 > delta_FR = -atan(L/r_inner) 内侧
+    // 这样右转 (R<0) 时转角为负, 左转 (R>0) 时转角为正, 且角度大小正确。
+    // 最后再对每个转角做 ±max_steer_angle 硬限幅, 物理上不可能超过。
+    // ============================================================
+    const double abs_R = std::abs(R);
+
+    // 内侧轮半径 = |R| - W/2 (靠近转弯中心), 需防除 0/负值
+    // 大转角时 abs_R 接近 W/2, r_inner 接近 0 → atan(L/r_inner) 接近 90°。
+    // 用 r_inner_min 钳制, 使 atan 结果不超过 max_steer_rad_eff。
+    double r_inner = abs_R - W / 2.0;
+    double r_outer = abs_R + W / 2.0;   // 外侧轮半径恒 > 0
+    // 由 atan(L / r) <= max_steer_rad_eff 反推 r 的下限:
+    double r_inner_min = L / std::tan(max_steer_rad_eff);
+    if (r_inner < r_inner_min) r_inner = r_inner_min;
+    if (r_inner < 0.05) r_inner = 0.05; // 最终防线, 防除 0
+
+    // 前轮转角 (带符号, 弧度): FL 与 FR 中, 靠近转弯中心的是内侧轮。
+    // 左转 (R>=0): 左侧(FL)是内侧轮 → |FL| > |FR|
+    // 右转 (R<0):  右侧(FR)是内侧轮 → |FR| > |FL|
+    double delta_FL;
+    double delta_FR;
+
+    if (R >= 0.0) {
+        // 左转：左前轮为内侧，右前轮为外侧
+        delta_FL = std::atan(L / r_inner);
+        delta_FR = std::atan(L / r_outer);
+    } else {
+        // 右转：右前轮为内侧，左前轮为外侧
+        delta_FL = -std::atan(L / r_outer);
+        delta_FR = -std::atan(L / r_inner);
+    }
+
+    // 硬限幅到物理转向角范围 [-max_steer_angle, +max_steer_angle]
+    delta_FL = std::max(-max_steer_rad, std::min(max_steer_rad, delta_FL));
+    delta_FR = std::max(-max_steer_rad, std::min(max_steer_rad, delta_FR));
+
+    // 6. 计算四个车轮的线速度
+    // 后轮 (直行轮) 速度 = 角速度 * 各自半径 (带符号, 倒车自动为负)
+    speeds[1] = static_cast<float>(omega * (R - W / 2.0)); // RL
+    speeds[3] = static_cast<float>(omega * (R + W / 2.0)); // RR
+
+    // 前轮速度 = 后轮速度 / cos(转角)。大转角时 cos→0 会使轮速放大。
+    // cos 下限对应 ~88.85° (与 max_steer_rad_eff 一致), 防除 0。
+    const double cos_FL = std::max(std::cos(delta_FL), std::cos(max_steer_rad_eff));
+    const double cos_FR = std::max(std::cos(delta_FR), std::cos(max_steer_rad_eff));
+    speeds[0] = static_cast<float>(speeds[1] / cos_FL); // FL
+    speeds[2] = static_cast<float>(speeds[3] / cos_FR); // FR
+
+    // ---- 单轮速度上限: 整组等比缩放, 保持阿克曼几何一致性 ----
+    // 大转角 (接近90°) 时前轮线速度 = 后轮速度 / cos(δ) 会被显著放大,
+    // 若某个轮速超过 max_wheel_speed_, 将所有轮速等比缩小, 避免下发超速。
+    // 这样运动学比例不变 (仍是正确阿克曼), 只是整体减速。
+    double max_spd = 0.0;
+    for (int i = 0; i < 4; i++)
+        max_spd = std::max(max_spd, static_cast<double>(std::abs(speeds[i])));
+    if (max_spd > max_wheel_speed_) {
+        double k = max_wheel_speed_ / max_spd;   // 0 < k < 1
+        for (int i = 0; i < 4; i++) speeds[i] = static_cast<float>(speeds[i] * k);
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Wheel speed limited: max %.2f m/s > %.2f, scaled all by %.2f",
+            max_spd, max_wheel_speed_, k);
+    }
+
+    // 转换为角度 (度)
+    angles[0] = static_cast<float>(delta_FL * 180.0 / M_PI); // FL
+    angles[2] = static_cast<float>(delta_FR * 180.0 / M_PI); // FR
+}
+
+// ============================================================
+// 【已注释】原 4WS (四轮转向) 实现 — 保留对照, 不再使用
+// 物理谬误: 给后轮也计算了转向角, ICR 设在车体几何中心, 非纯阿克曼
+// ============================================================
+// void MandaCanBridge::computeAckermannKinematics(float vx, float omega,
+//                                                 float speeds[4], float angles[4]) {
+//     const double Lx = wheel_base_x_;
+//     const double Ly = wheel_base_y_;
+//     const double max_steer_rad = max_steer_angle_ * M_PI / 180.0;
+//     const double halfPi = M_PI / 2.0;
+//
+//     // 原地旋转保护: vx≈0 且 omega≠0 时纯阿克曼无法表达, 拒绝
+//     constexpr double kMinLinearSpeed = 0.01;
+//     if (std::abs(vx) < kMinLinearSpeed && std::abs(omega) > 1e-6) {
+//         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+//             "Ackermann: in-place rotation rejected (vx=%.3f, wz=%.3f), output zero.",
+//             vx, omega);
+//         for (int i = 0; i < 4; i++) { speeds[i] = 0.0f; angles[i] = 0.0f; }
+//         return;
+//     }
+//
+//     const double wx[4] = { Lx, -Lx,  Lx, -Lx};  // FL, RL, FR, RR
+//     const double wy[4] = { Ly,  Ly, -Ly, -Ly};  // FL, RL, FR, RR
+//
+//     for (int i = 0; i < 4; i++) {
+//         double xi = wx[i];
+//         double yi = wy[i];
+//
+//         double vx_wheel = static_cast<double>(vx) - static_cast<double>(omega) * yi;
+//         double vy_wheel = static_cast<double>(omega) * xi;
+//
+//         double delta = std::atan2(vy_wheel, vx_wheel);
+//         if (delta >  halfPi) delta -= M_PI;
+//         else if (delta < -halfPi) delta += M_PI;
+//
+//         if (delta >  max_steer_rad) delta =  max_steer_rad;
+//         if (delta < -max_steer_rad) delta = -max_steer_rad;
+//
+//         double speed = vx_wheel * std::cos(delta) + vy_wheel * std::sin(delta);
+//
+//         angles[i] = static_cast<float>(delta * 180.0 / M_PI);
+//         speeds[i] = static_cast<float>(speed);
+//     }
+// }
+
+// ============================================================
+// CAN 基础发送
+// ============================================================
+bool MandaCanBridge::sendFrame(const struct can_frame &frame) {
+    int nbytes = write(can_socket_, &frame, sizeof(struct can_frame));
+    if (nbytes != static_cast<int>(sizeof(struct can_frame))) {
+        RCLCPP_WARN(this->get_logger(), "CAN send failed (id=0x%03x)", frame.can_id);
+        return false;
+    }
+    return true;
+}
+
+bool MandaCanBridge::sendWheelSpeeds(float v_fl, float v_rl, float v_fr, float v_rr) {
+    struct can_frame frame;
+    frame.can_id = 0x403;
+    frame.can_dlc = 8;
+    speedToCanBytes(v_fl, frame.data[0], frame.data[1]);
+    speedToCanBytes(v_rl, frame.data[2], frame.data[3]);
+    speedToCanBytes(v_fr, frame.data[4], frame.data[5]);
+    speedToCanBytes(v_rr, frame.data[6], frame.data[7]);
+    return sendFrame(frame);
+}
+
+bool MandaCanBridge::sendSteerAngles(float a_fl, float a_rl, float a_fr, float a_rr) {
+    struct can_frame frame;
+    frame.can_id = 0x404;
+    frame.can_dlc = 8;
+    angleToCanBytes(a_fl, frame.data[0], frame.data[1]);
+    angleToCanBytes(a_rl, frame.data[2], frame.data[3]);
+    angleToCanBytes(a_fr, frame.data[4], frame.data[5]);
+    angleToCanBytes(a_rr, frame.data[6], frame.data[7]);
+    return sendFrame(frame);
+}
+
+bool MandaCanBridge::sendAckermannCommand(float speeds[4], float angles[4]) {
+    bool ok = sendWheelSpeeds(speeds[0], speeds[1], speeds[2], speeds[3]);
+    ok = sendSteerAngles(angles[0], angles[1], angles[2], angles[3]) && ok;
+    return ok;
+}
+
+// ============================================================
+// cmd_vel 回调 (带倒车安全门)
+// ============================================================
+void MandaCanBridge::cmdVelCallback(
+    const geometry_msgs::msg::Twist::SharedPtr msg)
+{
+    last_cmd_time_ = this->now();
+
+    std::lock_guard<std::mutex> lock(velocity_mutex_);
+
+    const bool allow_reverse =
+        this->get_parameter("allow_reverse").as_bool();
+
+    const float max_reverse_speed = static_cast<float>(
+        std::max(
+            0.0,
+            this->get_parameter("max_reverse_speed").as_double()));
+
+    float requested_vx = static_cast<float>(msg->linear.x);
+    float requested_vz = static_cast<float>(msg->angular.z);
+
+    // 第一层：默认不允许负速度
+    if (!allow_reverse && requested_vx < 0.0f) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            1000,
+            "Reverse command blocked: vx=%.3f",
+            requested_vx);
+
+        requested_vx = 0.0f;
+    }
+
+    // 第二层：即使允许倒车，也限制最大倒车速度
+    requested_vx =
+        std::max(-max_reverse_speed, requested_vx);
+
+    // 限制角速度
+    const float max_vz =
+        static_cast<float>(max_angular_vel_);
+
+    requested_vz =
+        std::clamp(requested_vz, -max_vz, max_vz);
+
+    target_vx_ = requested_vx;
+    target_vz_ = requested_vz;
+
+    // 阿克曼不能原地旋转
+    if (std::abs(target_vx_) < 0.01f) {
+        target_vx_ = 0.0f;
+        target_vz_ = 0.0f;
+    }
+
+    // 曲率限速必须同比例缩放vx和wz，才能保持转弯半径不变
+    const float kEps = 0.001f;
+    const float abs_vx = std::abs(target_vx_);
+
+    if (abs_vx > 0.05f) {
+        const float curvature =
+            std::abs(target_vz_) / (abs_vx + kEps);
+
+        float scale = 1.0f;
+
+        if (curvature > 3.0f) {
+            scale = 0.25f;
+        } else if (curvature > 1.5f) {
+            scale = 0.50f;
+        }
+
+        if (scale < 1.0f) {
+            target_vx_ *= scale;
+            target_vz_ *= scale;
+
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "[CURV_LIMIT] scale=%.2f vx=%.3f wz=%.3f",
+                scale,
+                target_vx_,
+                target_vz_);
+        }
+    }
+
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        1000,
+        "[CMD] allow_reverse=%d input_vx=%.3f output_vx=%.3f wz=%.3f",
+        allow_reverse,
+        msg->linear.x,
+        target_vx_,
+        target_vz_);
+}
+
+// ============================================================
+// 心跳看门狗
+// ============================================================
+void MandaCanBridge::watchdogCheck() {
+    static bool was_timeout = false;
+    double elapsed = (this->now() - last_cmd_time_).seconds();
+    if (elapsed > watchdog_timeout_ && !is_estopped_ && !hw_estop_active_) {
+        if (!was_timeout) {
+            RCLCPP_WARN(this->get_logger(), "WATCHDOG: No cmd_vel for %.2fs, zeroing Ackermann commands!", elapsed);
+            std::lock_guard<std::mutex> lock(velocity_mutex_);
+            target_vx_ = 0.0f; target_vz_ = 0.0f;
+            was_timeout = true;
+        }
+    } else if (elapsed <= watchdog_timeout_) {
+        was_timeout = false;
+    }
+}
+
+// ============================================================
+// 循环下发线程: Ackermann Drive
+// ============================================================
+void MandaCanBridge::velocityLoop() {
+    while (rclcpp::ok() && velocity_running_) {
+        float vx, vz;
+        {
+            std::lock_guard<std::mutex> lock(velocity_mutex_);
+            vx = target_vx_; vz = target_vz_;
+        }
+
+        if (hw_estop_active_ || is_estopped_) {
+            float zero[4] = {0, 0, 0, 0};
+            sendAckermannCommand(zero, zero);
+        } else {
+            float speeds[4], angles[4];
+            computeAckermannKinematics(vx, vz, speeds, angles);
+
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[IK_DONE] R=%.3fm | FL: %.2fdeg %.3fm/s | RL: %.2fdeg %.3fm/s | FR: %.2fdeg %.3fm/s | RR: %.2fdeg %.3fm/s",
+                (std::abs(vz) < 1e-6 ? std::numeric_limits<double>::infinity() : static_cast<double>(vx) / vz),
+                angles[0], speeds[0], angles[1], speeds[1],
+                angles[2], speeds[2], angles[3], speeds[3]);
+
+            // ---- manda 调试: 打印实际下发的 0x403/0x404 原始字节 ----
+            // 改为 DEBUG 级别, 默认不输出, 避免每 100ms 刷屏淹没终端
+            uint8_t b403[8], b404[8];
+            uint8_t hi, lo;
+            speedToCanBytes(speeds[0], hi, lo); b403[0]=hi; b403[1]=lo;
+            speedToCanBytes(speeds[1], hi, lo); b403[2]=hi; b403[3]=lo;
+            speedToCanBytes(speeds[2], hi, lo); b403[4]=hi; b403[5]=lo;
+            speedToCanBytes(speeds[3], hi, lo); b403[6]=hi; b403[7]=lo;
+            angleToCanBytes(angles[0], hi, lo); b404[0]=hi; b404[1]=lo;
+            angleToCanBytes(angles[1], hi, lo); b404[2]=hi; b404[3]=lo;
+            angleToCanBytes(angles[2], hi, lo); b404[4]=hi; b404[5]=lo;
+            angleToCanBytes(angles[3], hi, lo); b404[6]=hi; b404[7]=lo;
+            RCLCPP_DEBUG(this->get_logger(),
+                "[TX] 403: %02X %02X %02X %02X %02X %02X %02X %02X | 404: %02X %02X %02X %02X %02X %02X %02X %02X",
+                b403[0], b403[1], b403[2], b403[3], b403[4], b403[5], b403[6], b403[7],
+                b404[0], b404[1], b404[2], b404[3], b404[4], b404[5], b404[6], b404[7]);
+
+            bool ok = sendAckermannCommand(speeds, angles);
+            RCLCPP_DEBUG(this->get_logger(),
+                "[CMD_SEND] CAN 0x403+0x404 send %s", ok ? "OK" : "FAIL");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(loop_ms_));
+    }
+}
+
+// ============================================================
+// CAN 接收线程 & 反馈解析
+// ============================================================
+void MandaCanBridge::canReceiveLoop() {
+    struct can_frame frame;
+    last_time_ = this->now();
+    last_joint_time_ = this->now();
+
+    while (rclcpp::ok() && receive_running_) {
+        int nbytes = read(can_socket_, &frame, sizeof(struct can_frame));
+        if (nbytes <= 0) {
+            if (!receive_running_ || !rclcpp::ok()) {
+                break;
+            }
+            if (errno == EBADF || errno == EINVAL) {
+                break;
+            }
+            continue;
+        }
+
+        switch (frame.can_id) {
+            // 0x100: 系统状态 + 硬件急停检测
+            case 0x100:
+                if (frame.can_dlc >= 8) {
+                    state_.battery_alarm   = frame.data[0];
+                    state_.control_mode    = frame.data[1];
+                    state_.peripheral_bits = frame.data[2];
+                    state_.battery_soc     = frame.data[3];
+
+                    hw_estop_active_ = (state_.peripheral_bits & 0x01) != 0;
+                    if (hw_estop_active_) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "HARDWARE ESTOP ACTIVE (0x100 data[2]=0x%02x)! Motors locked.", state_.peripheral_bits);
+                    }
+
+                    int16_t voltage_10mv = (static_cast<int16_t>(frame.data[4]) << 8) | frame.data[5];
+                    int16_t current_10ma = (static_cast<int16_t>(frame.data[6]) << 8) | frame.data[7];
+                    state_.battery_voltage_10mv = voltage_10mv;
+                    state_.battery_current_10ma = current_10ma;
+
+                    auto battery = sensor_msgs::msg::BatteryState();
+                    battery.header.stamp = this->now();
+                    battery.voltage = voltage_10mv * 0.01f;
+                    battery.current = current_10ma * 0.01f;
+                    battery.percentage = state_.battery_soc / 100.0f;
+                    battery.power_supply_status = (state_.battery_alarm & 0x01)
+                        ? sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_DISCHARGING
+                        : sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING;
+                    battery.power_supply_health = (state_.battery_alarm & 0x02)
+                        ? sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_DEAD
+                        : sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_GOOD;
+                    battery.present = true;
+                    battery_pub_->publish(battery);
+
+                    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "Battery: %.1fV %.1fA SOC=%d%% mode=%d estop=%d",
+                        voltage_10mv * 0.01, current_10ma * 0.01,
+                        state_.battery_soc, state_.control_mode, hw_estop_active_);
+                }
+                break;
+
+            // 0x101: 四轮速度反馈 → joint_states
+            case 0x101:
+                if (frame.can_dlc >= 8) {
+                    for (int i = 0; i < 4; i++)
+                        state_.wheel_speed[i] = canBytesToSpeed(frame.data[i*2], frame.data[i*2+1]);
+                    publishJointStates();
+                }
+                break;
+
+            // 0x102: 四轮转向角度反馈 → joint_states
+            case 0x102:
+                if (frame.can_dlc >= 8) {
+                    for (int i = 0; i < 4; i++)
+                        state_.steer_angle[i] = canBytesToAngle(frame.data[i*2], frame.data[i*2+1]);
+                    publishJointStates();
+                }
+                break;
+
+            // 0x103: 故障状态 → 安全急停
+            case 0x103:
+                if (frame.can_dlc >= 5) {
+                    state_.system_fault         = frame.data[0];
+                    state_.drv_fault_walk_bits  = frame.data[1];
+                    state_.drv_fault_steer_bits = frame.data[2];
+                    state_.drv_comm_lost_walk   = frame.data[3];
+                    state_.drv_comm_lost_steer  = frame.data[4];
+
+                    bool has_fault = (state_.system_fault != 0 ||
+                                      state_.drv_fault_walk_bits != 0 ||
+                                      state_.drv_fault_steer_bits != 0 ||
+                                      state_.drv_comm_lost_walk != 0 ||
+                                      state_.drv_comm_lost_steer != 0);
+
+                    if (has_fault && !is_estopped_) {
+                        is_estopped_ = true;
+                        RCLCPP_ERROR(this->get_logger(),
+                            "FAULT! sys=0x%02x walk=0x%02x steer=0x%02x lost_w=%d lost_s=%d",
+                            state_.system_fault, state_.drv_fault_walk_bits,
+                            state_.drv_fault_steer_bits, state_.drv_comm_lost_walk,
+                            state_.drv_comm_lost_steer);
+                        float zero[4] = {0,0,0,0};
+                        sendAckermannCommand(zero, zero);
+                    } else if (!has_fault && is_estopped_) {
+                        is_estopped_ = false;
+                        RCLCPP_INFO(this->get_logger(), "FAULT CLEARED");
+                    }
+                }
+                break;
+
+            // 0x104: 运动反馈 → 里程计推算
+            case 0x104: {
+                float vx = canBytesToSpeed(frame.data[0], frame.data[1]);
+                float vy = canBytesToSpeed(frame.data[2], frame.data[3]);
+                // manda 修复: vz 为角速度, 可能因底盘固件标度/单位 (deg/s vs rad/s)
+                // 与代码假设不符导致 Yaw 积分偏差, 用 vz_scale_ 修正。
+                float vz = canBytesToSpeed(frame.data[4], frame.data[5]) * vz_scale_;
+                state_.motion_vx = vx;
+                state_.motion_vy = vy;
+                state_.motion_vz = vz;
+                state_.current_mode = frame.data[6];
+                state_.mode_switch_state = frame.data[7];
+
+                rclcpp::Time current_time = this->now();
+                double dt = (current_time - last_time_).seconds();
+                if (dt <= 0.0) dt = 0.01;
+
+                double delta_x = (vx * std::cos(th_) - vy * std::sin(th_)) * dt;
+                double delta_y = (vx * std::sin(th_) + vy * std::cos(th_)) * dt;
+                double delta_th = vz * dt;
+
+                x_ += delta_x;
+                y_ += delta_y;
+                th_ += delta_th;
+                // manda 修复: 规范化 Yaw 到 [-π, π], 防止长时间运行精度下降
+                th_ = std::remainder(th_, 2.0 * M_PI);
+                last_time_ = current_time;
+
+                auto odom = nav_msgs::msg::Odometry();
+                odom.header.stamp = current_time;
+                odom.header.frame_id = odom_frame_id_;
+                odom.child_frame_id = base_frame_id_;
+                odom.pose.pose.position.x = x_;
+                odom.pose.pose.position.y = y_;
+                odom.pose.pose.position.z = 0.0;
+                tf2::Quaternion q;
+                q.setRPY(0, 0, th_);
+                odom.pose.pose.orientation.x = q.x();
+                odom.pose.pose.orientation.y = q.y();
+                odom.pose.pose.orientation.z = q.z();
+                odom.pose.pose.orientation.w = q.w();
+                odom.twist.twist.linear.x = vx;
+                odom.twist.twist.linear.y = vy;
+                odom.twist.twist.angular.z = vz;
+
+                // ---- manda 修复: 填充 twist 协方差 ----
+                // 底盘 0x104 反馈的 vx/vy/vz 有噪声/量化误差, 若协方差全 0,
+                // robot_localization EKF 会把这些测量当"绝对准确"融合,
+                // 导致对噪声极度敏感 → 航向/位置震荡 → 雷达点云乱窜。
+                // 设置合理的协方差 (单位: m^2/s^2 与 rad^2/s^2), 让 EKF 平衡信任度。
+                // 6x6 对角线: [vx, vy, vz, vroll, vpitch, vyaw]
+                //   vx: 轮速编码器, 较可靠 → 1e-2
+                //   vy: 阿克曼模式无横移, 噪声大 → 1e-1 (且已在 EKF 中关闭融合)
+                //   vz (vyaw): 转向反馈, 有一定噪声 → 5e-3
+                const double odom_twist_cov[36] = {
+                    1.0e-2, 0, 0, 0, 0, 0,
+                    0, 1.0e-1, 0, 0, 0, 0,
+                    0, 0, 1.0e-6, 0, 0, 0,
+                    0, 0, 0, 1.0e-6, 0, 0,
+                    0, 0, 0, 0, 1.0e-6, 0,
+                    0, 0, 0, 0, 0, 5.0e-3
+                };
+                std::copy(std::begin(odom_twist_cov), std::end(odom_twist_cov),
+                          odom.twist.covariance.begin());
+
+                odom_pub_->publish(odom);
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
+}
+
+// ============================================================
+// 发布 joint_states (0x101 轮速 + 0x102 转角 → 累计位置)
+// ============================================================
+void MandaCanBridge::publishJointStates() {
+    auto js = sensor_msgs::msg::JointState();
+    js.header.stamp = this->now();
+
+    rclcpp::Time now = this->now();
+    double dt = (now - last_joint_time_).seconds();
+    if (dt <= 0.0) dt = 0.02;
+    last_joint_time_ = now;
+
+    // 关节名必须与 manda.urdf 中的关节名完全一致, 否则 robot_state_publisher
+    // 无法匹配, rviz 中车轮/转向臂不显示, 模型会"变白块"。
+    js.name = {
+        "front_left_wheel_rotor_joint", "rear_left_wheel_rotor_joint",
+        "front_right_wheel_rotor_joint", "rear_right_wheel_rotor_joint",
+        "front_left_wheel_steer_joint", "rear_left_wheel_steer_joint",
+        "front_right_wheel_steer_joint", "rear_right_wheel_steer_joint"
+    };
+    js.position.resize(8);
+    js.velocity.resize(8);
+
+    for (int i = 0; i < 4; i++) {
+        const double wheel_angular_speed = state_.wheel_speed[i] / wheel_radius_;
+        wheel_pos_[i] += wheel_angular_speed * dt;
+        js.position[i] = wheel_pos_[i];
+        js.velocity[i] = wheel_angular_speed;
+        steer_pos_[i] = state_.steer_angle[i] * M_PI / 180.0;
+        js.position[4 + i] = steer_pos_[i];
+        js.velocity[4 + i] = 0.0;
+    }
+    joint_state_pub_->publish(js);
+}

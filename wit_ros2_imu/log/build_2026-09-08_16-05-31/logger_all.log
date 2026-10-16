@@ -1,0 +1,94 @@
+[0.182s] DEBUG:colcon:Command line arguments: ['/usr/bin/colcon', 'build', '--symlink-install', '--packages-select', 'turn_on_wheeltec_robot_01', 'wit_ros2_imu']
+[0.182s] DEBUG:colcon:Parsed command line arguments: Namespace(log_base=None, log_level=None, verb_name='build', build_base='build', install_base='install', merge_install=False, symlink_install=True, test_result_base=None, continue_on_error=False, executor='parallel', parallel_workers=6, event_handlers=None, ignore_user_meta=False, metas=['./colcon.meta'], base_paths=['.'], packages_ignore=None, packages_ignore_regex=None, paths=None, packages_up_to=None, packages_up_to_regex=None, packages_above=None, packages_above_and_dependencies=None, packages_above_depth=None, packages_select_by_dep=None, packages_skip_by_dep=None, packages_skip_up_to=None, packages_select_build_failed=False, packages_skip_build_finished=False, packages_select_test_failures=False, packages_skip_test_passed=False, packages_select=['turn_on_wheeltec_robot_01', 'wit_ros2_imu'], packages_skip=None, packages_select_regex=None, packages_skip_regex=None, packages_start=None, packages_end=None, allow_overriding=[], cmake_args=None, cmake_target=None, cmake_target_skip_unavailable=False, cmake_clean_cache=False, cmake_clean_first=False, cmake_force_configure=False, ament_cmake_args=None, catkin_cmake_args=None, catkin_skip_building_tests=False, verb_parser=<colcon_defaults.argument_parser.defaults.DefaultArgumentsDecorator object at 0xffff8a6a9570>, verb_extension=<colcon_core.verb.build.BuildVerb object at 0xffff8a80fd30>, main=<bound method BuildVerb.main of <colcon_core.verb.build.BuildVerb object at 0xffff8a80fd30>>)
+[0.502s] Level 1:colcon.colcon_core.package_discovery:discover_packages(colcon_meta) check parameters
+[0.502s] Level 1:colcon.colcon_core.package_discovery:discover_packages(recursive) check parameters
+[0.502s] Level 1:colcon.colcon_core.package_discovery:discover_packages(ignore) check parameters
+[0.502s] Level 1:colcon.colcon_core.package_discovery:discover_packages(path) check parameters
+[0.503s] Level 1:colcon.colcon_core.package_discovery:discover_packages(colcon_meta) discover
+[0.503s] Level 1:colcon.colcon_core.package_discovery:discover_packages(recursive) discover
+[0.503s] INFO:colcon.colcon_core.package_discovery:Crawling recursively for packages in '/nvme/sunrise/manda_cpy/src/wit_ros2_imu'
+[0.503s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['ignore', 'ignore_ament_install']
+[0.504s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'ignore'
+[0.504s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'ignore_ament_install'
+[0.504s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['colcon_pkg']
+[0.504s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'colcon_pkg'
+[0.504s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['colcon_meta']
+[0.504s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'colcon_meta'
+[0.505s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['ros']
+[0.505s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'ros'
+[0.567s] DEBUG:colcon.colcon_core.package_identification:Package '.' with type 'ros.ament_python' and name 'wit_ros2_imu'
+[0.567s] Level 1:colcon.colcon_core.package_discovery:discover_packages(recursive) using defaults
+[0.568s] Level 1:colcon.colcon_core.package_discovery:discover_packages(ignore) discover
+[0.568s] Level 1:colcon.colcon_core.package_discovery:discover_packages(ignore) using defaults
+[0.568s] Level 1:colcon.colcon_core.package_discovery:discover_packages(path) discover
+[0.568s] Level 1:colcon.colcon_core.package_discovery:discover_packages(path) using defaults
+[0.568s] WARNING:colcon.colcon_core.package_selection:ignoring unknown package 'turn_on_wheeltec_robot_01' in --packages-select
+[0.606s] Level 1:colcon.colcon_core.package_discovery:discover_packages(prefix_path) check parameters
+[0.606s] Level 1:colcon.colcon_core.package_discovery:discover_packages(prefix_path) discover
+[0.616s] DEBUG:colcon.colcon_installed_package_information.package_discovery:Found 68 installed packages in /nvme/sunrise/manda_cpy/install
+[0.619s] DEBUG:colcon.colcon_installed_package_information.package_discovery:Found 328 installed packages in /opt/ros/humble
+[0.624s] Level 1:colcon.colcon_core.package_discovery:discover_packages(prefix_path) using defaults
+[0.698s] Level 5:colcon.colcon_core.verb:set package 'wit_ros2_imu' build argument 'cmake_args' from command line to 'None'
+[0.698s] Level 5:colcon.colcon_core.verb:set package 'wit_ros2_imu' build argument 'cmake_target' from command line to 'None'
+[0.698s] Level 5:colcon.colcon_core.verb:set package 'wit_ros2_imu' build argument 'cmake_target_skip_unavailable' from command line to 'False'
+[0.699s] Level 5:colcon.colcon_core.verb:set package 'wit_ros2_imu' build argument 'cmake_clean_cache' from command line to 'False'
+[0.699s] Level 5:colcon.colcon_core.verb:set package 'wit_ros2_imu' build argument 'cmake_clean_first' from command line to 'False'
+[0.699s] Level 5:colcon.colcon_core.verb:set package 'wit_ros2_imu' build argument 'cmake_force_configure' from command line to 'False'
+[0.699s] Level 5:colcon.colcon_core.verb:set package 'wit_ros2_imu' build argument 'ament_cmake_args' from command line to 'None'
+[0.699s] Level 5:colcon.colcon_core.verb:set package 'wit_ros2_imu' build argument 'catkin_cmake_args' from command line to 'None'
+[0.699s] Level 5:colcon.colcon_core.verb:set package 'wit_ros2_imu' build argument 'catkin_skip_building_tests' from command line to 'False'
+[0.699s] DEBUG:colcon.colcon_core.verb:Building package 'wit_ros2_imu' with the following arguments: {'ament_cmake_args': None, 'build_base': '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu', 'catkin_cmake_args': None, 'catkin_skip_building_tests': False, 'cmake_args': None, 'cmake_clean_cache': False, 'cmake_clean_first': False, 'cmake_force_configure': False, 'cmake_target': None, 'cmake_target_skip_unavailable': False, 'install_base': '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu', 'merge_install': False, 'path': '/nvme/sunrise/manda_cpy/src/wit_ros2_imu', 'symlink_install': True, 'test_result_base': None}
+[0.699s] INFO:colcon.colcon_core.executor:Executing jobs using 'parallel' executor
+[0.701s] DEBUG:colcon.colcon_parallel_executor.executor.parallel:run_until_complete
+[0.701s] INFO:colcon.colcon_ros.task.ament_python.build:Building ROS package in '/nvme/sunrise/manda_cpy/src/wit_ros2_imu' with build type 'ament_python'
+[0.701s] Level 1:colcon.colcon_core.shell:create_environment_hook('wit_ros2_imu', 'ament_prefix_path')
+[0.706s] INFO:colcon.colcon_core.plugin_system:Skipping extension 'colcon_core.shell.bat': Not used on non-Windows systems
+[0.706s] INFO:colcon.colcon_core.shell:Creating environment hook '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/hook/ament_prefix_path.ps1'
+[0.708s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/hook/ament_prefix_path.dsv'
+[0.709s] INFO:colcon.colcon_core.shell:Creating environment hook '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/hook/ament_prefix_path.sh'
+[0.710s] INFO:colcon.colcon_core.shell:Skip shell extension 'powershell' for command environment: Not usable outside of PowerShell
+[0.710s] DEBUG:colcon.colcon_core.shell:Skip shell extension 'dsv' for command environment
+[1.440s] INFO:colcon.colcon_core.task.python.build:Building Python package in '/nvme/sunrise/manda_cpy/src/wit_ros2_imu'
+[1.440s] INFO:colcon.colcon_core.shell:Skip shell extension 'powershell' for command environment: Not usable outside of PowerShell
+[1.441s] DEBUG:colcon.colcon_core.shell:Skip shell extension 'dsv' for command environment
+[2.305s] DEBUG:colcon.colcon_core.task.python.build:Available setuptools commands: install_scripts, rotate, test, build, build_clib, dist_info, install_headers, saveopts, bdist_rpm, upload_docs, egg_info, build_py, bdist_wheel, bdist_dumb, install_lib, register, symlink_data, install_data, alias, build_scripts, easy_install, sdist, install, setopt, isort, build_ext, check, develop, clean, upload, bdist, install_egg_info, bdist_egg, build_cmake
+[3.128s] DEBUG:colcon.colcon_core.task.python.build:Available setuptools 'develop' options: --user, --local-snapshots-ok, --zip-ok, --install-dir, --allow-hosts, --quiet, --no-deps, --no-find-links, --always-copy, --egg-path, --upgrade, --install-layout, --dry-run, --record, --always-unzip, --version, --optimize, --exclude-scripts, --build-directory, --uninstall, --force-installation-into-system-dir, --help, --script-dir, --multi-version, --site-dirs, --find-links, --editable, --prefix, --index-url, --verbose, --no-user-cfg
+[3.131s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoking command in '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu': PYTHONPATH=/nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/build --no-deps symlink_data
+[4.276s] Level 1:colcon.colcon_core.shell:create_environment_hook('wit_ros2_imu', 'pythonpath_develop')
+[4.277s] INFO:colcon.colcon_core.shell:Creating environment hook '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/share/wit_ros2_imu/hook/pythonpath_develop.ps1'
+[4.277s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoked command in '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu' returned '0': PYTHONPATH=/nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/build --no-deps symlink_data
+[4.278s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/share/wit_ros2_imu/hook/pythonpath_develop.dsv'
+[4.279s] INFO:colcon.colcon_core.shell:Creating environment hook '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/share/wit_ros2_imu/hook/pythonpath_develop.sh'
+[4.284s] Level 1:colcon.colcon_core.environment:checking '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu' for CMake module files
+[4.284s] Level 1:colcon.colcon_core.environment:checking '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu' for CMake config files
+[4.285s] Level 1:colcon.colcon_core.environment:checking '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/lib'
+[4.286s] Level 1:colcon.colcon_core.environment:checking '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/bin'
+[4.286s] Level 1:colcon.colcon_core.environment:checking '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/lib/pkgconfig/wit_ros2_imu.pc'
+[4.286s] Level 1:colcon.colcon_core.environment:checking '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/lib/python3.10/site-packages'
+[4.286s] Level 1:colcon.colcon_core.shell:create_environment_hook('wit_ros2_imu', 'pythonpath')
+[4.287s] INFO:colcon.colcon_core.shell:Creating environment hook '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/hook/pythonpath.ps1'
+[4.288s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/hook/pythonpath.dsv'
+[4.288s] INFO:colcon.colcon_core.shell:Creating environment hook '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/hook/pythonpath.sh'
+[4.289s] Level 1:colcon.colcon_core.environment:checking '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/bin'
+[4.289s] Level 1:colcon.colcon_core.environment:create_environment_scripts_only(wit_ros2_imu)
+[4.290s] INFO:colcon.colcon_core.shell:Creating package script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/package.ps1'
+[4.292s] INFO:colcon.colcon_core.shell:Creating package descriptor '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/package.dsv'
+[4.293s] INFO:colcon.colcon_core.shell:Creating package script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/package.sh'
+[4.294s] INFO:colcon.colcon_core.shell:Creating package script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/package.bash'
+[4.295s] INFO:colcon.colcon_core.shell:Creating package script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu/package.zsh'
+[4.296s] Level 1:colcon.colcon_core.environment:create_file_with_runtime_dependencies(/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/colcon-core/packages/wit_ros2_imu)
+[4.297s] DEBUG:colcon.colcon_parallel_executor.executor.parallel:closing loop
+[4.297s] DEBUG:colcon.colcon_parallel_executor.executor.parallel:loop closed
+[4.297s] DEBUG:colcon.colcon_parallel_executor.executor.parallel:run_until_complete finished with '0'
+[4.298s] DEBUG:colcon.colcon_core.event_reactor:joining thread
+[4.298s] DEBUG:colcon.colcon_core.event_reactor:joined thread
+[4.298s] INFO:colcon.colcon_core.shell:Creating prefix script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/local_setup.ps1'
+[4.300s] INFO:colcon.colcon_core.shell:Creating prefix util module '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/_local_setup_util_ps1.py'
+[4.302s] INFO:colcon.colcon_core.shell:Creating prefix chain script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/setup.ps1'
+[4.308s] INFO:colcon.colcon_core.shell:Creating prefix script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/local_setup.sh'
+[4.309s] INFO:colcon.colcon_core.shell:Creating prefix util module '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/_local_setup_util_sh.py'
+[4.310s] INFO:colcon.colcon_core.shell:Creating prefix chain script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/setup.sh'
+[4.316s] INFO:colcon.colcon_core.shell:Creating prefix script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/local_setup.bash'
+[4.317s] INFO:colcon.colcon_core.shell:Creating prefix chain script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/setup.bash'
+[4.323s] INFO:colcon.colcon_core.shell:Creating prefix script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/local_setup.zsh'
+[4.324s] INFO:colcon.colcon_core.shell:Creating prefix chain script '/nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/setup.zsh'

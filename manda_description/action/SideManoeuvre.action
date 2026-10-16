@@ -1,0 +1,8 @@
+float32 vy
+float32 vx
+float32 duration
+---
+bool success
+string message
+---
+float32 progress

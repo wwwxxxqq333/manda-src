@@ -1,0 +1,181 @@
+<?xml version="1.0" ?>
+<robot name="manda" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <material name="black">
+    <color rgba="0.15 0.15 0.15 1.0"/>
+  </material>
+  <material name="white">
+    <color rgba="0.9 0.9 0.9 1.0"/>
+  </material>
+  <material name="red">
+    <color rgba="1.0 0.0 0.0 1.0"/>
+  </material>
+  <material name="blue">
+    <color rgba="0.0 0.0 1.0 1.0"/>
+  </material>
+
+  <link name="base_footprint"/>
+  
+  <link name="base_link"/>
+  <joint name="footprint_to_base" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+  </joint>
+
+  <link name="body">
+    <visual>
+      <origin xyz="0 0 0.06" rpy="0 0 0"/>
+      <geometry><box size="0.73 0.50 0.12"/></geometry>
+      <material name="white"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 -0.06" rpy="0 0 0"/>
+      <geometry><box size="0.50 0.28 0.12"/></geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.0625" rpy="0 0 0"/>
+      <geometry><box size="0.73 0.50 0.365"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+      <mass value="90.0"/>
+      <inertia ixx="2.0" ixy="0" ixz="0" iyy="4.0" iyz="0" izz="5.0"/>
+    </inertial>
+  </link>
+  
+  <joint name="base_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.24"/> 
+    <parent link="base_link"/>
+    <child link="body"/>
+  </joint>
+
+  <!-- ===== 底盘主体 (body) 摩擦/碰撞属性 ===== -->
+  <!-- 实车模式：不需要 Gazebo 标签，已删除 -->
+
+  <link name="laser_link">
+    <visual>
+      <geometry><cylinder length="0.025" radius="0.025"/></geometry>
+      <material name="blue"/>
+    </visual>
+    <collision>
+      <geometry><cylinder length="0.025" radius="0.025"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+  <joint name="laser_joint" type="fixed">
+    <!-- 2026-09-16 实测安装: 中心距车头端面(x=+0.365) 103mm -> x=0.262;
+         高度 = 车体顶面(z=0.36) 上方 11.6mm -> z=0.3716; 左右居中 y=0 -->
+    <origin rpy="0 0 0" xyz="0.262 0 0.3716"/> <parent link="base_link"/>
+    <child link="laser_link"/>
+  </joint>
+
+  <link name="imu_link">
+    <visual>
+      <!-- IMU 小板 29.6 x 44.3mm: 短边(29.6)与车头平行 -> 沿 y; 长边(44.3)沿 x -->
+      <geometry><box size="0.0443 0.0296 0.01"/></geometry>
+      <material name="red"/>
+    </visual>
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
+    </inertial>
+  </link>
+  <!-- IMU 独立安装在底盘 base_link 上（不再挂在废弃的速腾雷达下） -->
+  <!-- 2026-09-16 实测安装: 板后边缘距车头端面(x=+0.365) 202mm (=144+58)
+       -> 后边缘 x=0.163; 长边 44.3mm 沿 x -> 中心 x = 0.163 + 0.0443/2 = 0.18515;
+       高度与雷达一致 -> z=0.3716; 左右居中 y=0 -->
+  <joint name="imu_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.18515 0 0.3716"/>
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+  </joint>
+
+  <xacro:macro name="wheel_module" params="prefix x_offset y_offset">
+    
+    <link name="${prefix}_wheel_steer">
+      <visual>
+        <origin rpy="0 0 0" xyz="0 0 -0.05"/>
+        <geometry><box size="0.06 0.04 0.10"/></geometry>
+        <material name="black"/>
+      </visual>
+      <inertial>
+        <mass value="1.0"/>
+        <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_wheel_steer_joint" type="revolute">
+      <origin rpy="0 0 0" xyz="${x_offset} ${y_offset} -0.04"/>
+      <parent link="body"/>
+      <child link="${prefix}_wheel_steer"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="-0.75" upper="0.75" effort="10" velocity="1.0"/>  <!-- ±43°, 与底盘 max_steer_angle 一致 -->
+    </joint>
+
+    <link name="${prefix}_wheel_rotor">
+      <visual>
+        <geometry>
+          <cylinder length="0.06" radius="0.10"/>
+        </geometry>
+        <material name="black"/>
+      </visual>
+      <collision>
+        <geometry>
+          <sphere radius="0.10"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <mass value="4.0"/>
+        <inertia ixx="0.012" ixy="0" ixz="0" iyy="0.012" iyz="0" izz="0.02"/>
+      </inertial>
+    </link>
+    
+    <joint name="${prefix}_wheel_rotor_joint" type="continuous">
+      <origin rpy="-1.570796 0 0" xyz="0 0 -0.10"/>
+      <parent link="${prefix}_wheel_steer"/>
+      <child link="${prefix}_wheel_rotor"/>
+      <axis xyz="0 1 0"/>
+    </joint>
+
+    <!-- 实车模式：已删除 wheel_rotor 的 Gazebo 摩擦标签 -->
+  </xacro:macro>
+
+  <xacro:wheel_module prefix="front_left" x_offset="0.24" y_offset="0.19" />
+  <xacro:wheel_module prefix="front_right" x_offset="0.24" y_offset="-0.19" />
+  <xacro:wheel_module prefix="rear_left" x_offset="-0.24" y_offset="0.19" />
+  <xacro:wheel_module prefix="rear_right" x_offset="-0.24" y_offset="-0.19" />
+
+  <!-- ===== 实车速腾雷达 (rslidar) 固定安装 ===== -->
+  <!-- 安装位置: 车顶中心向前 10.5cm, 垫 0.45cm 塑料板, 方向与 base_link 一致 -->
+  <link name="rslidar">
+    <visual>
+      <geometry><cylinder length="0.06" radius="0.08"/></geometry>
+      <material name="blue"/>
+    </visual>
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+  <joint name="rslidar_joint" type="fixed">
+    <!-- 与 laser_link 同安装位置 (同一雷达支架), 保持一致 -->
+    <origin rpy="0 0 0" xyz="0.262 0 0.3716"/>
+    <parent link="base_link"/>
+    <child link="rslidar"/>
+  </joint>
+
+  <!-- ===== 实车模式：以下已删除所有 Gazebo 传感器插件和 ros2_control 硬件接口 ===== -->
+  <!--
+    已删除的内容：
+    - <gazebo reference="laser_link"> 及其内嵌的 libgazebo_ros_ray_sensor 插件
+    - <gazebo reference="imu_link"> 及其内嵌的 libgazebo_ros_imu_sensor 插件
+    - <gazebo> 中的 libgazebo_ros_p3d ground truth odometry 插件
+    - <ros2_control name="GazeboSystem" type="system"> 全部 Gazebo ros2_control 接口
+    - <gazebo> 中的 libgazebo_ros2_control 插件
+  -->
+
+</robot>

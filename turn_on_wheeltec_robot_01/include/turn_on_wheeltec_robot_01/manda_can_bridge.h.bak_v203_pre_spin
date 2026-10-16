@@ -1,0 +1,152 @@
+#ifndef __MANDA_CAN_BRIDGE_H_
+#define __MANDA_CAN_BRIDGE_H_
+
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/battery_state.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_ros/transform_broadcaster.h>
+
+#include <linux/can.h>
+#include <linux/can/raw.h>
+
+#include <thread>
+#include <mutex>
+#include <memory>
+#include <string>
+
+// ============================================================
+// 四轮独立驱动与转向 (4WID-4WIS) 的纯阿克曼 (Ackermann) CAN 桥接
+// ============================================================
+// 协议概述:
+//   上位机 → 底盘: 0x401(模式), 0x403(4轮线速度), 0x404(4轮转角)
+//   底盘 → 上位机: 0x100(系统状态/电池), 0x101(4轮速度回馈),
+//                  0x102(4轮角度回馈), 0x103(故障), 0x104(运动反馈)
+// ============================================================
+
+class MandaCanBridge : public rclcpp::Node {
+public:
+    MandaCanBridge();
+    ~MandaCanBridge();
+
+private:
+    // ============================================================
+    // 底盘反馈状态聚合
+    // ============================================================
+    struct ChassisState {
+        // 0x100 系统状态
+        uint8_t  battery_alarm   = 0;
+        uint8_t  control_mode    = 0;
+        uint8_t  peripheral_bits = 0;
+        uint8_t  battery_soc     = 0;
+        int16_t  battery_voltage_10mv  = 0;
+        int16_t  battery_current_10ma  = 0;
+        // 0x101 四轮速度反馈 (m/s)
+        float wheel_speed[4] = {0};
+        // 0x102 四轮转向角度反馈 (度)
+        float steer_angle[4] = {0};
+        // 0x103 故障
+        uint8_t  system_fault          = 0;
+        uint8_t  drv_fault_walk_bits   = 0;
+        uint8_t  drv_fault_steer_bits  = 0;
+        uint8_t  drv_comm_lost_walk    = 0;
+        uint8_t  drv_comm_lost_steer   = 0;
+        // 0x104 运动反馈
+        float    motion_vx = 0, motion_vy = 0, motion_vz = 0;
+        uint8_t  current_mode   = 0;
+        uint8_t  mode_switch_state = 1;
+    };
+
+    // ---- 机器人几何参数 ----
+    double wheel_base_x_ = 0.24;  // 前后半轴距 (m)
+    double wheel_base_y_ = 0.19;  // 左右半轮距 (m)
+    double wheel_radius_ = 0.10;   // 车轮半径 (m)
+    double wheel_base_  = 0.48;   // 全轴距 L = 2 * wheel_base_x_
+    double track_width_ = 0.38;   // 全轮距 W = 2 * wheel_base_y_
+    double max_steer_angle_ = 45.0; // 转向角安全限位 (度) — V2.03 从 90° 收敛到 45°
+    double max_wheel_speed_ = 2.0;  // 单轮速度上限 (m/s), 超过则整组等比缩放
+    double max_angular_vel_ = 0.8;  // cmd_vel 最大角速度 (rad/s) — V2.03 新增 clamp
+
+    // ---- CAN & 线程 ----
+    int can_socket_ = -1;
+    std::thread receive_thread_;
+    std::thread velocity_thread_;
+    bool receive_running_ = true;
+
+    // ---- ROS 2 接口 ----
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::BatteryState>::SharedPtr battery_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
+    rclcpp::TimerBase::SharedPtr watchdog_timer_;
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+    // ---- 速度目标 (阿克曼仅使用 linear.x 与 angular.z) ----
+    bool velocity_running_ = true;
+    float target_vx_ = 0.0f, target_vz_ = 0.0f;
+    mutable std::mutex velocity_mutex_;
+    rclcpp::Time last_cmd_time_;
+
+    // ---- 安全状态 ----
+    bool is_estopped_ = false;       // 0x103 故障触发
+    bool hw_estop_active_ = false;   // 0x100 硬件急停
+
+    // ---- 里程计 ----
+    double x_ = 0.0, y_ = 0.0, th_ = 0.0;
+    rclcpp::Time last_time_;
+
+    // ---- 关节累计角度 (用于 joint_states 位置, 单位 rad) ----
+    double wheel_pos_[4] = {0};  // rad
+    double steer_pos_[4] = {0};  // rad
+    rclcpp::Time last_joint_time_;
+
+    // ---- 帧 ID ----
+    // manda 修复: 与 EKF (ekf.yaml) 一致, 避免 frame 混淆
+    std::string odom_frame_id_ = "odom_combined";
+    std::string base_frame_id_ = "base_footprint";
+
+    // ---- 0x104 角速度标度修正 (vz_scale) ----
+    // 底盘固件 vz 可能不是 rad/s 或标度不匹配, 用此系数修正 Yaw 积分
+    double vz_scale_ = 1.0;
+
+    // ---- 循环/看门狗周期 (参数化) ----
+    int loop_ms_ = 100;            // 下发 0x403/0x404 周期
+    double watchdog_timeout_ = 0.5; // cmd_vel 心跳超时 (秒)
+
+    ChassisState state_;
+
+    // ============================================================
+    // 数据转换工具
+    // ============================================================
+    static inline void speedToCanBytes(float speed_mps, uint8_t &hi, uint8_t &lo);
+    static inline void angleToCanBytes(float angle_deg, uint8_t &hi, uint8_t &lo);
+    static inline float canBytesToSpeed(uint8_t hi, uint8_t lo);
+    static inline float canBytesToAngle(uint8_t hi, uint8_t lo);
+
+    // ============================================================
+    // 纯阿克曼 (Ackermann) 逆运动学
+    // ============================================================
+    void computeAckermannKinematics(float vx, float omega,
+                                    float speeds[4], float angles[4]);
+
+    // ============================================================
+    // CAN 基础发送
+    // ============================================================
+    bool sendFrame(const struct can_frame &frame);
+    bool sendWheelSpeeds(float v_fl, float v_rl, float v_fr, float v_rr);
+    bool sendSteerAngles(float a_fl, float a_rl, float a_fr, float a_rr);
+    bool sendAckermannCommand(float speeds[4], float angles[4]);
+
+    // ============================================================
+    // 回调 & 循环
+    // ============================================================
+    void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
+    void watchdogCheck();
+    void velocityLoop();
+    void canReceiveLoop();
+    void publishJointStates();
+};
+
+#endif  // __MANDA_CAN_BRIDGE_H_

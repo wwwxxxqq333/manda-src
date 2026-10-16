@@ -1,0 +1,31 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="3" name="NavigateThroughPosesAckermannOnly">
+      <Sequence name="PlanAndFollow">
+        <ComputePathThroughPoses
+          goals="{goals}"
+          path="{path}"
+          planner_id="HybridPlanner"/>
+
+        <FollowPath
+          path="{path}"
+          controller_id="FollowPath"/>
+      </Sequence>
+
+      <Sequence name="ClearAndRetry">
+        <ClearEntireCostmap
+          name="ClearLocalCostmap"
+          service_name="local_costmap/clear_entirely_local_costmap"/>
+
+        <ClearEntireCostmap
+          name="ClearGlobalCostmap"
+          service_name="global_costmap/clear_entirely_global_costmap"/>
+
+        <Fallback name="SpinOrWait">
+          <Spin name="SpinRecovery" spin_dist="1.570796" time_allowance="20"/>
+          <Wait wait_duration="0.1"/>
+        </Fallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

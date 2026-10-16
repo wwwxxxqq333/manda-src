@@ -1,0 +1,64 @@
+
+
+1. 先清理旧进程
+如果你前面已经起过很多次 launch，先执行这段，避免串口和 TF 重复占用：
+
+sudo pkill -9 -f "ros2 launch manda_description bringup_all.launch.py"
+sudo pkill -9 -f "wit_ros2_imu"
+sudo pkill -9 -f "lslidar_driver_node"
+sudo pkill -9 -f "can_bridge_node"
+sudo pkill -9 -f "robot_state_publisher"
+sudo pkill -9 -f "ekf_node"
+sudo pkill -9 -f "ros2 daemon"
+sudo fuser -k /dev/ttyUSB0 /dev/ttyUSB1
+sudo pkill -9 -f "chassis_bridge_node"
+sudo pkill -9 -f "turn_on_wheeltec_robot_01.launch"
+sudo pkill -9 -f "wheeltec_nav2.launch"
+
+2. 建图阶段
+先起底层硬件和传感器，不要把导航一起拉起来：
+
+source setup.bash
+source setup.bash
+ros2 launch manda_description bringup_all.launch.py nav:=false imu:=true lidar_2d:=true
+
+然后另开一个终端，启动 slam_toolbox：
+
+source setup.bash
+source setup.bash
+ros2 launch manda_description manda_slam_toolbox.launch.py
+
+3. 保存地图
+slam_toolbox 建图完成后，用 Nav2 自带的保存工具导出地图：
+
+source setup.bash
+source setup.bash
+ros2 run nav2_map_server map_saver_cli -f /home/sunrise/manda/maps/manda_map
+
+把 my_map 换成你要保存的名字。会生成对应的 yaml 和 pgm。
+
+4. 导航阶段
+先保留底层驱动，再单独起导航：
+
+source setup.bash
+source setup.bash
+ros2 launch manda_description bringup_all.launch.py nav:=false imu:=true lidar_2d:=true
+
+另开一个终端，加载地图并启动导航：
+
+source setup.bash
+source setup.bash
+ros2 launch manda_description bringup_navigation.launch.py
+
+
+5. 可选的快速检查命令
+如果你想在起完之后快速确认 URDF、TF、雷达、IMU 是否都正常，可以用：
+
+ros2 topic list
+ros2 topic echo /imu/data --once
+ros2 topic echo /scan --once
+ros2 topic echo /x10/lslidar_point_cloud --once
+ros2 topic echo /odom_wheel --once
+ros2 run tf2_ros tf2_echo odom base_footprint
+
+对应代码位置你现在这套流程是对齐的，底层在 bringup_all.launch.py，建图在 manda_slam_toolbox.launch.py，纯导航在 bringup_navigation.launch.py，URDF 和 EKF 在 robot_core.launch.py。

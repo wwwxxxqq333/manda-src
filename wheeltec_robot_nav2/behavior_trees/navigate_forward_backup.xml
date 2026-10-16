@@ -1,0 +1,110 @@
+<!--
+  manda 阿克曼专用 BT — 稳定全局路径 + 失败时碰撞检查自旋并重规划
+  ============================================================
+  【★★★ 2026-09-29 重要教训, 改本文件前必读 ★★★】
+  本文件曾短暂改回 <RateController hz="1.0"> 每秒重规划, 结果立刻重现
+  "到点后原地绕圈/画圈"。这是 V2.05 已修过的 bug:
+      git show 81383f5b
+      "去掉 RateController hz=1.0 每秒全局重规划 (DUBIN 终点绕圈根因)"
+  根因: DUBIN 从【当前位姿】重新搜索, 车一动位姿就变 -> 每秒出一条
+        不同的进场弧线; 终点附近路径点挤在一起, 弧线在目标两侧反复
+        横跳, 车就绕着目标画圈。yaw 容差 0.20rad 在这种横跳下永远
+        收敛不了。
+  ∴ 全局路径必须【一段导航内保持不变】, 只允许在真正失效时重算。
+  ⇒ 不要用 RateController。用下面的 IsPathValid 门控。
+
+  【本版本结构与 V2.05 一致 (已被现场验证)】
+    <PipelineSequence>           每帧重 tick 之前的子节点
+      └ <RecoveryNode retries=1>
+          <Fallback name="ComputePathFallback">
+            <ReactiveSequence name="CheckIfPathStillValid">
+              <Inverter><GlobalUpdatedGoal/></Inverter>  非新目标
+              <IsPathValid path="{path}"/>               且路径仍有效
+            </ReactiveSequence>      -> 成立: Fallback 成功, 沿用现有 path
+            <ComputePathToPose .../> -> 不成立(路径空/失效/新目标): 重规划
+          </Fallback>
+          <ClearEntireCostmap .../> 规划失败才清全局代价图
+      └ <FollowPath .../>
+
+  【关键源码依据】IsPathValid 对【空路径】返回 invalid:
+      planner_server.cpp:538  if (request->path.poses.empty())
+                                  response->is_valid = false;
+    ⇒ 首次 tick 时 {path} 为空 -> 必然走 ComputePathToPose, 能正常起步。
+    另: 它只把 LETHAL(254) 与 INSCRIBED(253) 判为失效, 即"路径穿进
+        车体中心 0.26m 硬区"才重算 —— 这正是我们需要的最小触发条件。
+
+  【保留 Fallback 而非直接 IsPathValid 的原因】
+    PipelineSequence 在子节点 RUNNING 时会重 tick 之前的兄弟节点;
+    用一个恒返回成功的 Fallback 把"检查+重规划"包成一个【原子门】,
+    避免 IsPathValid 的瞬时 FAILURE 打断 PipelineSequence 的正常流水。
+
+  【恢复分支】
+  清理代价地图后先调用 Spin。Spin 自身会检查机器人足迹的旋转扫掠空间；
+  若起点处于致命空间或旋转会碰撞，则回退到 Wait，再继续重规划。
+  BackUp 仍不启用，因为底盘倒车被明确禁止。
+
+  依赖节点(均已确认可用):
+    Inverter / ReactiveFallback  -> BT.CPP 核心 (libbehaviortree_cpp_v3.so)
+    GlobalUpdatedGoal / IsPathValid / PipelineSequence / RecoveryNode
+    ClearEntireCostmap / ComputePathToPose / FollowPath -> nav2_behavior_tree
+  注: 本文件在 install/ 下是 symlink, 改完重启导航即生效, 无需 colcon build。
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="3" name="NavigateAckermannOnly">
+      <PipelineSequence name="PlanAndFollowWithStablePath">
+
+        <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+          <Fallback name="ComputePathFallback">
+            <!-- 路径仍有效且目标未变 -> 沿用现有路径, 不重算 -->
+            <ReactiveSequence name="CheckIfPathStillValid">
+              <Inverter>
+                <GlobalUpdatedGoal/>
+              </Inverter>
+              <IsPathValid path="{path}"/>
+            </ReactiveSequence>
+            <ComputePathToPose
+              goal="{goal}"
+              path="{path}"
+              planner_id="HybridPlanner"/>
+          </Fallback>
+          <ClearEntireCostmap
+            name="ClearGlobalCostmapContext"
+            service_name="global_costmap/clear_entirely_global_costmap"/>
+        </RecoveryNode>
+
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath
+            path="{path}"
+            controller_id="FollowPath"/>
+          <Sequence name="ClearOnFollowFailure">
+            <ClearEntireCostmap
+              name="ClearLocalCostmapContext"
+              service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap
+              name="ClearGlobalCostmapFollow"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+        </RecoveryNode>
+
+      </PipelineSequence>
+
+      <Sequence name="ClearAndRetry">
+        <ClearEntireCostmap
+          name="ClearLocalCostmap"
+          service_name="local_costmap/clear_entirely_local_costmap"/>
+
+        <ClearEntireCostmap
+          name="ClearGlobalCostmap"
+          service_name="global_costmap/clear_entirely_global_costmap"/>
+
+        <!-- 先由 Spin 的局部碰撞检查决定是否能原地脱困。
+             起点/旋转空间无效时回退到 Wait，再重新规划。 -->
+        <Fallback name="SpinOrWait">
+          <Spin name="SpinRecovery" spin_dist="1.570796" time_allowance="20"/>
+          <Wait wait_duration="0.1"/>
+        </Fallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

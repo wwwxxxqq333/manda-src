@@ -1,0 +1,24 @@
+running develop
+running egg_info
+creating wit_ros2_imu.egg-info
+writing wit_ros2_imu.egg-info/PKG-INFO
+writing dependency_links to wit_ros2_imu.egg-info/dependency_links.txt
+writing entry points to wit_ros2_imu.egg-info/entry_points.txt
+writing requirements to wit_ros2_imu.egg-info/requires.txt
+writing top-level names to wit_ros2_imu.egg-info/top_level.txt
+writing manifest file 'wit_ros2_imu.egg-info/SOURCES.txt'
+reading manifest file 'wit_ros2_imu.egg-info/SOURCES.txt'
+writing manifest file 'wit_ros2_imu.egg-info/SOURCES.txt'
+running build_ext
+Creating /nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/lib/python3.10/site-packages/wit-ros2-imu.egg-link (link to .)
+Installing wit_ros2_imu script to /nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/lib/wit_ros2_imu
+
+Installed /nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu
+running symlink_data
+creating /nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/ament_index
+creating /nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/ament_index/resource_index
+creating /nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/ament_index/resource_index/packages
+symbolically linking /nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/resource/wit_ros2_imu -> /nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/ament_index/resource_index/packages
+symbolically linking /nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/package.xml -> /nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu
+symbolically linking /nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/launch/rviz_and_imu.launch.py -> /nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu
+symbolically linking /nvme/sunrise/manda_cpy/src/wit_ros2_imu/build/wit_ros2_imu/launch/wit_imu.launch.py -> /nvme/sunrise/manda_cpy/src/wit_ros2_imu/install/wit_ros2_imu/share/wit_ros2_imu
